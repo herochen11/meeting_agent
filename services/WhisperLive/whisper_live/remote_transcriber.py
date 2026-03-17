@@ -277,10 +277,11 @@ class RemoteTranscriber:
         }
         
         # Prepare form data
+        # Note: Only include standard OpenAI-compatible fields.
+        # Custom fields like transcription_tier are sent via headers only.
         data = {
             "model": self.model,
             "temperature": self.temperature,
-            "transcription_tier": self.transcription_tier,
         }
         
         if self.vad_model:
@@ -299,8 +300,9 @@ class RemoteTranscriber:
         if self.response_format:
             data["response_format"] = self.response_format
         
-        if self.timestamp_granularities:
-            data["timestamp_granularities"] = self.timestamp_granularities
+        # timestamp_granularities not supported by Groq API, skip for remote
+        # if self.timestamp_granularities:
+        #     data["timestamp_granularities"] = self.timestamp_granularities
         
         # Log request details (masked)
         auth_header_masked = f"Bearer {self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "Bearer ***"
@@ -332,6 +334,9 @@ class RemoteTranscriber:
                         detail=response.text[:500] if response.text else "",
                     )
                 
+                if response.status_code >= 400:
+                    logger.error(f"API error {response.status_code}: {response.text[:500]}")
+                    logger.error(f"Request data: {data}")
                 response.raise_for_status()
                 
                 # Parse response
@@ -402,6 +407,47 @@ class RemoteTranscriber:
         # Should not reach here, but just in case
         raise last_exception or RuntimeError("Remote API call failed")
     
+    # Known Whisper hallucination patterns (appears during silence/noise)
+    HALLUCINATION_PATTERNS = [
+        "请不吝点赞",
+        "订阅 转发 打赏",
+        "支持明镜与点点栏目",
+        "明镜与点点",
+        "谢谢大家的收看",
+        "字幕由",
+        "字幕提供",
+        "Thanks for watching",
+        "Thank you for watching",
+        "Please subscribe",
+        "Like and subscribe",
+        "MozilaFirefox",
+        "www.mooji.org",
+        "Amara.org",
+        "Sottotitoli creati",
+        "ご視聴ありがとうございました",
+    ]
+
+    @staticmethod
+    def _is_hallucination(text: str) -> bool:
+        """Detect common Whisper hallucination patterns."""
+        if not text or not text.strip():
+            return True
+        text_clean = text.strip()
+        # Check against known patterns
+        for pattern in RemoteTranscriber.HALLUCINATION_PATTERNS:
+            if pattern in text_clean:
+                logger.debug(f"Filtered hallucination: {text_clean[:80]}")
+                return True
+        # Detect highly repetitive text (same phrase repeated)
+        words = text_clean.split()
+        if len(words) >= 4:
+            # Check if text is just the same few words repeated
+            unique_ratio = len(set(words)) / len(words)
+            if unique_ratio < 0.3:
+                logger.debug(f"Filtered repetitive text: {text_clean[:80]}")
+                return True
+        return False
+
     def _response_to_segments(
         self,
         api_response: dict,
@@ -633,6 +679,9 @@ class RemoteTranscriber:
         
         # Convert to segments
         segments = self._response_to_segments(api_response)
+        
+        # Filter out Whisper hallucinations (repetitive garbage text during silence)
+        segments = [s for s in segments if not self._is_hallucination(s.text)]
         
         # Extract language info and normalize to ISO code
         api_language = api_response.get("language")
