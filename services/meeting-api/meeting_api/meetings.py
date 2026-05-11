@@ -1028,8 +1028,8 @@ async def request_bot(
     # System defaults for timeouts (ms)
     SYSTEM_DEFAULTS = {
         "max_bot_time": 7200000,          # 2h
-        "max_wait_for_admission": 900000, # 15 min
-        "max_time_left_alone": 900000,    # 15 min
+        "max_wait_for_admission": 300000, # 5 min
+        "max_time_left_alone": 45000,    # 45 sec
         "no_one_joined_timeout": 120000,  # 2 min
     }
 

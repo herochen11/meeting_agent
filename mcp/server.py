@@ -57,6 +57,8 @@ GOOGLE_CREDS   = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON",
 SHARE_WITH_EMAIL = os.getenv("SHARE_WITH_EMAIL", "mojojo0802@gmail.com")
 CONFIG_FILE = os.getenv("CONFIG_FILE",
                         os.path.join(_PROJECT_ROOT, "config", "departments.json"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Google Sheets headers
 SHEET_HEADERS = ["編號", "任務描述", "負責人", "優先級", "狀態", "預計完成時間", "來源會議", "會議日期", "備註"]
@@ -76,6 +78,23 @@ def _write_config(config: dict) -> bool:
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+MEETING_MAP_FILE = os.path.join(_PROJECT_ROOT, "config", "meeting_map.json")
+
+def _read_meeting_map() -> dict:
+    try:
+        with open(MEETING_MAP_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _write_meeting_map(mapping: dict) -> bool:
+    try:
+        with open(MEETING_MAP_FILE, "w") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
@@ -114,14 +133,15 @@ async def list_tools() -> list[types.Tool]:
         # ── Vexa Tools ──
         types.Tool(
             name="join_meeting",
-            description="送 Vexa bot 進入 Google Meet 會議。",
+            description="送 Vexa bot 進入 Google Meet 會議。必須傳入 chat_id 以記錄會議屬於哪個群組（部門隔離用）。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "meet_id": {"type": "string", "description": "Google Meet ID 或完整連結"},
+                    "chat_id": {"type": "string", "description": "TG 群組 chat_id，用於記錄會議所屬部門"},
                     "bot_name": {"type": "string", "description": "Bot 在會議中顯示的名稱，預設 NoirsBoxes Meeting Bot"}
                 },
-                "required": ["meet_id"]
+                "required": ["meet_id", "chat_id"]
             }
         ),
         types.Tool(
@@ -141,12 +161,14 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_meetings",
-            description="列出最近幾場會議記錄。",
+            description="列出最近幾場會議記錄。傳入 chat_id 只顯示該群組的會議（部門隔離）。",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "chat_id": {"type": "string", "description": "TG 群組 chat_id，只顯示該群組的會議"},
                     "limit": {"type": "integer", "description": "數量，預設 5", "default": 5}
-                }
+                },
+                "required": ["chat_id"]
             }
         ),
         types.Tool(
@@ -364,6 +386,21 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["system_name"]
             }
         ),
+
+        # ── Telegram 通知 Tools ──
+        types.Tool(
+            name="send_processing",
+            description="發送「處理中」提示訊息到 TG 群組。收到用戶訊息後立即呼叫，讓用戶知道 bot 正在處理。\n"
+                        "回傳 message_id，處理完成後用 Claude Code 內建的 edit_message 更新狀態。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "TG 群組 chat_id"},
+                    "text": {"type": "string", "description": "提示訊息，預設『⏳ 處理中...』"}
+                },
+                "required": ["chat_id"]
+            }
+        ),
     ]
 
 
@@ -372,13 +409,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
         # Vexa tools
         if name == "join_meeting":
-            result = await _join_meeting(arguments.get("meet_id", ""), arguments.get("bot_name", "NoirsBoxes 會議助理"))
+            result = await _join_meeting(arguments.get("meet_id", ""), arguments.get("chat_id", ""), arguments.get("bot_name", "NoirsBoxes 會議助理"))
         elif name == "stop_bot":
             result = await _stop_bot(arguments.get("meet_id", ""))
         elif name == "get_status":
             result = await _get_status()
         elif name == "get_meetings":
-            result = await _get_meetings(arguments.get("limit", 5))
+            result = await _get_meetings(arguments.get("chat_id", ""), arguments.get("limit", 5))
         elif name == "get_transcript":
             result = await _get_transcript(arguments.get("native_meeting_id", ""))
         elif name == "summarize_meeting":
@@ -438,6 +475,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 _update_member, arguments.get("system_name", ""),
                 arguments.get("tg_username", ""), arguments.get("transcript_names")
             )
+        # Telegram 通知 tools
+        elif name == "send_processing":
+            result = await _send_processing(
+                arguments.get("chat_id", ""),
+                arguments.get("text", "⏳ 處理中...")
+            )
         else:
             result = f"未知工具：{name}"
         return [types.TextContent(type="text", text=result)]
@@ -447,7 +490,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 # ── Vexa 工具實作 ─────────────────────────────────────────────
 
-async def _join_meeting(meet_id: str, bot_name: str = "NoirsBoxes Meeting Bot") -> str:
+async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsBoxes Meeting Bot") -> str:
     meet_id = meet_id.strip().lower()
     if "meet.google.com/" in meet_id:
         meet_id = meet_id.split("meet.google.com/")[-1].split("?")[0]
@@ -460,6 +503,11 @@ async def _join_meeting(meet_id: str, bot_name: str = "NoirsBoxes Meeting Bot") 
         if r.status_code in (200, 201):
             data = r.json()
             mid  = data.get("meeting_id") or data.get("id")
+            # 記錄會議屬於哪個群組（部門隔離）
+            if chat_id:
+                mapping = _read_meeting_map()
+                mapping[meet_id] = str(chat_id)
+                _write_meeting_map(mapping)
             return json.dumps({"success": True, "meet_id": meet_id, "meeting_id": mid}, ensure_ascii=False)
         elif r.status_code == 409:
             return json.dumps({"success": False, "reason": f"Bot 已在會議 {meet_id} 中"}, ensure_ascii=False)
@@ -496,14 +544,22 @@ async def _get_status() -> str:
         }, ensure_ascii=False)
 
 
-async def _get_meetings(limit: int = 5) -> str:
+async def _get_meetings(chat_id: str = "", limit: int = 5) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(f"{VEXA_API_URL}/meetings", headers={"X-API-Key": VEXA_API_KEY})
         if r.status_code != 200:
             return json.dumps({"error": f"無法取得會議列表 {r.status_code}"}, ensure_ascii=False)
         data     = r.json()
         meetings = data.get("meetings", data) if isinstance(data, dict) else data
-        meetings = meetings[:limit] if isinstance(meetings, list) else []
+        meetings = meetings if isinstance(meetings, list) else []
+
+        # 部門隔離：用 meeting_map 過濾該群組的會議
+        if chat_id:
+            mapping = _read_meeting_map()
+            allowed_meet_ids = {mid for mid, cid in mapping.items() if str(cid) == str(chat_id)}
+            meetings = [m for m in meetings if m.get("native_meeting_id", "") in allowed_meet_ids]
+
+        meetings = meetings[:limit]
         result   = [{"id": m.get("id"), "native_meeting_id": m.get("native_meeting_id"),
                      "status": m.get("status"),
                      "start_time": m.get("start_time", "")[:16] if m.get("start_time") else None} for m in meetings]
@@ -537,7 +593,7 @@ async def _get_transcript(native_meeting_id: str) -> str:
 async def _summarize_meeting(meeting_id: int, native_meeting_id: str = "", start_time: str = "") -> str:
     # 如果沒有 native_meeting_id，從 meetings API 查詢
     if not native_meeting_id:
-        meetings_result = await _get_meetings(20)
+        meetings_result = await _get_meetings("", 20)
         meetings_data = json.loads(meetings_result)
         for m in meetings_data.get("meetings", []):
             if m.get("id") == meeting_id:
@@ -955,6 +1011,28 @@ def _delete_cron(name: str) -> str:
         }, ensure_ascii=False)
     else:
         return json.dumps({"success": False, "error": "寫入 crontab 失敗"}, ensure_ascii=False)
+
+
+# ── Telegram 通知工具實作 ─────────────────────────────────
+
+async def _send_processing(chat_id: str, text: str = "⏳ 處理中...") -> str:
+    """透過 Telegram Bot API 發送處理中提示，回傳 message_id"""
+    if not BOT_TOKEN:
+        return json.dumps({"success": False, "error": "BOT_TOKEN 未設定"}, ensure_ascii=False)
+    if not chat_id:
+        return json.dumps({"success": False, "error": "缺少 chat_id"}, ensure_ascii=False)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{TG_API_BASE}/sendMessage",
+            json={"chat_id": chat_id, "text": text}
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("ok"):
+                message_id = data["result"]["message_id"]
+                return json.dumps({"success": True, "message_id": message_id}, ensure_ascii=False)
+        return json.dumps({"success": False, "error": f"Telegram API 錯誤: {r.status_code} {r.text[:200]}"}, ensure_ascii=False)
 
 
 # ── 啟動 ──────────────────────────────────────────────────────

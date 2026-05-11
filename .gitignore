@@ -136,6 +136,8 @@ token.json
 .env.backup
 mcp/webhook-channel.log
 mcp/server.py.bak
+config/departments.json
+config/meeting_map.json
 
 # Backups & temp files
 *.backup

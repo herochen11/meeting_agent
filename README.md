@@ -53,7 +53,7 @@ Claude Code Session（WSL）
     └── api-gateway/
 ```
 
-## MCP Tools 清單（17 個）
+## MCP Tools 清單（18 個）
 
 | 分類 | Tool | 說明 |
 |---|---|---|
@@ -75,6 +75,7 @@ Claude Code Session（WSL）
 | Config | `get_config` | 讀取部門 + 人員對應表 |
 | Config | `add_department` | 新增部門 |
 | Config | `update_member` | 更新人員 TG Username / 逐字稿名字 |
+| TG 通知 | `send_processing` | 發送「處理中」提示，回傳 message_id |
 
 ## Docker 服務（Vexa 0.10.6）
 

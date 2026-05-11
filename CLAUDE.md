@@ -50,6 +50,9 @@
 - `list_crons` — 列出所有定時任務
 - `delete_cron` — 刪除定時任務
 
+### Telegram 通知
+- `send_processing` — 發送「處理中」提示訊息到 TG 群組，回傳 message_id（後續用 edit_message 更新狀態）
+
 使用範例：
 - 設定單一部門跟催：`set_cron(name="reminder-業務部", schedule="0 9 * * *", webhook_path="/hooks/daily-reminder?chat_id=XXX&department=業務部&sheet_id=YYY")`
 - 修改時間：`set_cron(name="reminder-業務部", schedule="0 10 * * *", webhook_path="/hooks/daily-reminder?chat_id=XXX&department=業務部&sheet_id=YYY")`
@@ -298,6 +301,20 @@ MMDD 會議主題
 - 未完成判斷：預計完成時間 < 今天 且 狀態 ≠ 已完成
 - 不要使用「逾期」這個詞，用「未完成」代替
 - 跟催通知要 tag 負責人（用 @ 提及）
+
+---
+
+## 回覆行為規則
+
+### 處理中提示
+收到用戶訊息後，使用以下流程回覆：
+
+1. 立即呼叫 `send_processing(chat_id)` → 用戶看到「⏳ 處理中...」
+2. 執行實際操作（查詢、寫入、生成報告等）
+3. 完成後用 `edit_message` 把「處理中」改成「✅ 完成」
+4. 發送一則新的 reply 帶完整內容（觸發推撥通知）
+
+注意：edit_message 不會觸發手機推撥，所以最終結果必須用新 reply 發送。
 
 ---
 
