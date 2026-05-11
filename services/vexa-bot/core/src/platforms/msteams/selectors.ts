@@ -246,6 +246,43 @@ export const teamsContinueButtonSelectors: string[] = [
   'button:has-text("Continue")'
 ];
 
+// v0.10.5 — Pre-join "Continue without audio or video" confirmation dialog.
+//
+// Teams renders this modal when the browser denies (or the OS user dismissed)
+// camera/mic permission. Wireframe of the modal:
+//
+//   "Are you sure you don't want audio or video?
+//    If you change your mind, select the camera icon by your address bar
+//    and then Always allow."
+//   [ Continue without audio or video ]    [ X (dismiss) ]
+//
+// The dialog is intermittent — it fires only when Chromium's media-permission
+// state for the host is "denied" at the moment the prejoin page boots. With
+// our PulseAudio + headless setup the OS-level perm dialog is auto-handled,
+// but Chromium occasionally lands on this confirmation modal anyway (observed
+// 2026-04-30 in compose). When it appears, the bot is BLOCKED — the prejoin
+// "Join now" button never enables until the modal is dismissed.
+//
+// We click "Continue without audio or video" — equivalent to dismissing the
+// modal. We don't actually need browser-level media permissions: the bot
+// receives audio via the RTCPeerConnection ontrack hook (see join.ts
+// addInitScript) and the Vexa Virtual Camera shim handles voice-agent video.
+//
+// Multi-selector coverage: aria-label, exact text, partial text (locale
+// variants), and a generic [role="dialog"] descendant fallback.
+export const teamsContinueWithoutMediaSelectors: string[] = [
+  // Most specific — exact button text
+  'button:has-text("Continue without audio or video")',
+  // aria-label variants
+  'button[aria-label="Continue without audio or video"]',
+  'button[aria-label*="Continue without audio"]',
+  // Partial text — handles trailing/leading whitespace
+  'button:text-matches("Continue without audio or video", "i")',
+  // Inside a dialog (most reliable scope)
+  '[role="dialog"] button:has-text("Continue without audio or video")',
+  '[role="alertdialog"] button:has-text("Continue without audio or video")',
+];
+
 export const teamsJoinButtonSelectors: string[] = [
   'button:has-text("Join")',
   'button:has-text("Join now")'
@@ -349,6 +386,37 @@ export const teamsParticipantIdSelectors: string[] = [
   '[data-participant-id]',
   '[data-user-id]'
 ];
+
+// Teams live captions selectors.
+//
+// IMPORTANT — DOM variance between host and guest views:
+//   HOST:  wrapper > window-wrapper > virtual-list-content > items-renderer > ChatMessageCompact > author + text
+//   GUEST: wrapper > window-wrapper > virtual-list-content > (div) > author + text  (NO items-renderer)
+//
+// The ONLY stable selectors across both views are:
+//   - rendererWrapper:  the top-level caption container (always present when captions enabled)
+//   - authorName:       [data-tid="author"] — speaker name (stable atom)
+//   - captionText:      [data-tid="closed-caption-text"] — spoken text (stable atom)
+//
+// DO NOT rely on captionItem (closed-captions-v2-items-renderer) — it only exists in host view.
+// Instead, query authorName and captionText directly inside rendererWrapper and pair by index.
+// See recording.ts processCaptions() for the implementation.
+//
+// Verified 2026-03-19 on both host (Speaker D account) and guest (bot) views.
+export const teamsCaptionSelectors = {
+  /** Top-level caption container. Present when captions are enabled AND someone has spoken. */
+  rendererWrapper: '[data-tid="closed-caption-renderer-wrapper"]',
+  /** @deprecated Host-only. Use authorName/captionText directly. */
+  captionItem: '[data-tid="closed-captions-v2-items-renderer"]',
+  /** Speaker name — stable across host and guest views. Pair with captionText by index. */
+  authorName: '[data-tid="author"]',
+  /** Caption text — stable across host and guest views. Pair with authorName by index. */
+  captionText: '[data-tid="closed-caption-text"]',
+  /** Virtual list content container */
+  virtualListContent: '[data-tid="closed-caption-v2-virtual-list-content"]',
+  /** Meeting toolbar More button (stable id) */
+  moreButton: '#callingButtons-showMoreBtn',
+};
 
 // Primary hangup button selector (most reliable)
 export const teamsPrimaryHangupButtonSelector = '#hangup-button';

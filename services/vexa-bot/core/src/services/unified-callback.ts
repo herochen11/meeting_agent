@@ -1,24 +1,64 @@
 import { log } from "../utils";
 
-export type MeetingStatus = 
+export type MeetingStatus =
   | "joining"
-  | "awaiting_admission" 
+  | "awaiting_admission"
   | "active"
+  | "needs_human_help"
   | "completed"
   | "failed";
 
-export type CompletionReason = 
+export type CompletionReason =
   | "stopped"
   | "validation_error"
   | "awaiting_admission_timeout"
   | "awaiting_admission_rejected"
   | "left_alone"
-  | "evicted";
+  | "evicted"
+  | "max_bot_time_exceeded";
 
-export type FailureStage = 
+export type FailureStage =
   | "requested"
   | "joining"
+  | "awaiting_admission"
   | "active";
+
+// v0.10.6 (#294) — bot-side failure_stage tracker keep-current.
+//
+// `currentLifecycleStage` is updated on each successful status_change
+// callback emission for joining / awaiting_admission / active so that
+// crashes past joining no longer get persisted as `failure_stage:
+// "joining"`. v0.10.5's #276 added server-side derivation in
+// MeetingResponse.from_orm — that fixes the API surface but the JSONB
+// row still stored the wrong value at write-time. This tracker fixes
+// it at write-time too.
+//
+// The lifecycle ordering is requested → joining → awaiting_admission →
+// active. The tracker only ever advances (never goes backwards), so
+// ordering is enforced via STAGE_ORDER below.
+const STAGE_ORDER: Record<FailureStage, number> = {
+  requested: 0,
+  joining: 1,
+  awaiting_admission: 2,
+  active: 3,
+};
+
+let currentLifecycleStage: FailureStage = "joining";
+
+export function getCurrentLifecycleStage(): FailureStage {
+  return currentLifecycleStage;
+}
+
+/**
+ * Advance the lifecycle stage tracker. Only advances forward — calling
+ * with an earlier stage is a no-op (defends against stage emit races
+ * where a delayed `joining` callback arrives after `active` has emitted).
+ */
+export function advanceLifecycleStage(next: FailureStage): void {
+  if (STAGE_ORDER[next] > STAGE_ORDER[currentLifecycleStage]) {
+    currentLifecycleStage = next;
+  }
+}
 
 export interface UnifiedCallbackPayload {
   connection_id: string;
@@ -31,6 +71,21 @@ export interface UnifiedCallbackPayload {
   completion_reason?: CompletionReason;
   failure_stage?: FailureStage;
   timestamp?: string;
+  speaker_events?: any[];
+  // v0.10.5.3 Pack O: ring-buffer of last N structured-JSON log lines from
+  // the bot's stdout, sent on terminal status_change for forensic capture.
+  // meeting-api persists these into meetings.data.bot_logs JSONB.
+  bot_logs?: string[];
+  // v0.10.5.3 Pack T: cgroup-based resource summary at exit time.
+  // meeting-api persists this into meetings.data.bot_resources JSONB.
+  bot_resources?: {
+    samples: number;
+    peak_memory_bytes: number | null;
+    last_memory_bytes: number | null;
+    cpu_usage_usec_total: number | null;
+    sampler_started_at: string;
+    cgroup_available: boolean;
+  };
 }
 
 /**
@@ -44,10 +99,19 @@ export async function callStatusChangeCallback(
   exitCode?: number,
   errorDetails?: any,
   completionReason?: CompletionReason,
-  failureStage?: FailureStage
+  failureStage?: FailureStage,
+  speakerEvents?: any[],
+  // v0.10.5.3 Pack O + Pack T — terminal-only forensic fields.
+  // bot_logs: last N structured-JSON log lines from bot stdout (ring buffer).
+  // bot_resources: cgroup memory + CPU summary at exit time.
+  // Optional in callback shape; only populated by performGracefulLeave on
+  // terminal status (failed/completed). meeting-api persists both into
+  // meetings.data JSONB on the status_change handler.
+  botLogs?: string[],
+  botResources?: UnifiedCallbackPayload["bot_resources"]
 ): Promise<void> {log(`🔥 UNIFIED CALLBACK: ${status.toUpperCase()} - reason: ${reason || 'none'}`);
   
-  if (!botConfig.botManagerCallbackUrl) {log("Warning: No bot manager callback URL configured. Cannot send status change callback.");
+  if (!botConfig.meetingApiCallbackUrl) {log("Warning: No callback URL configured. Cannot send status change callback.");
     return;
   }
 
@@ -63,7 +127,7 @@ export async function callStatusChangeCallback(
     let timeoutId: NodeJS.Timeout | null = null;
     try {
       // Convert the callback URL to the unified endpoint
-      const baseUrl = botConfig.botManagerCallbackUrl.replace('/exited', '/status_change');
+      const baseUrl = botConfig.meetingApiCallbackUrl.replace('/exited', '/status_change');
       
       const payload: UnifiedCallbackPayload = {
         connection_id: botConfig.connectionId,
@@ -74,7 +138,10 @@ export async function callStatusChangeCallback(
         error_details: errorDetails,
         completion_reason: completionReason,
         failure_stage: failureStage,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        speaker_events: speakerEvents,
+        bot_logs: botLogs,
+        bot_resources: botResources,
       };
 
       log(`Sending unified status change callback to ${baseUrl} (attempt ${attempt + 1}/${maxRetries})`);
@@ -97,7 +164,26 @@ export async function callStatusChangeCallback(
       if (response.ok) {
         // Read and validate response body
         const responseBody = await response.json();
-        if (responseBody.status === 'processed' || responseBody.status === 'ok' || responseBody.status === 'container_updated') {log(`${status} status change callback sent and processed successfully`);
+        // `ignored` is returned when the meeting is already in stopping state
+        // (stop_requested=true) and the bot's in-flight status-change is
+        // superseded. This is a terminal success for the bot's perspective —
+        // the server acknowledged the call and deliberately declined to
+        // transition because the user already requested stop. Without this,
+        // a user-requested DELETE while the bot's joining callback is
+        // in-flight triggers 3 retries + a 'server rejected' exception, and
+        // the meeting ends up in `failed` instead of `completed`.
+        if (
+          responseBody.status === 'processed' ||
+          responseBody.status === 'ok' ||
+          responseBody.status === 'container_updated' ||
+          responseBody.status === 'ignored'
+        ) {log(`${status} status change callback sent and processed successfully (status=${responseBody.status})`);
+          // v0.10.6 (#294): advance the lifecycle tracker on each
+          // successful callback. Crashes after this point will now
+          // attribute to the correct stage at write-time.
+          if (status === "joining" || status === "awaiting_admission" || status === "active") {
+            advanceLifecycleStage(status);
+          }
           return; // Success, exit retry loop
         } else {log(`Callback returned unexpected status: ${responseBody.status}, detail: ${responseBody.detail || 'none'}`);
           // If not last attempt, retry
@@ -127,10 +213,13 @@ export async function callStatusChangeCallback(
         const delay = baseDelay * Math.pow(2, attempt);
         log(`Retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
-      } else {log(`All ${maxRetries} callback attempts failed. Bot-manager may not have received the status change.`);
+      } else {log(`All ${maxRetries} callback attempts failed for ${status} status change.`);
+        throw new Error(`All ${maxRetries} callback attempts failed for ${status} status change`);
       }
     }
   }
+  // If we get here without returning (success), all retries were exhausted via non-exception path
+  throw new Error(`${status} callback failed: server rejected after ${maxRetries} attempts`);
 }
 
 /**
@@ -144,6 +233,7 @@ export function mapExitReasonToStatus(
     // Successful exits (completed)
     switch (reason) {
       case "admission_failed":
+      case "admission_timeout":
         return { status: "completed", completionReason: "awaiting_admission_timeout" };
       case "self_initiated_leave":
         return { status: "completed", completionReason: "stopped" };
@@ -159,20 +249,33 @@ export function mapExitReasonToStatus(
         return { status: "completed", completionReason: "stopped" };
     }
   } else {
-    // Failed exits
+    // Failed exits.
+    //
+    // v0.10.6 (#294): the tracker keeps the in-process record of the
+    // furthest-advanced lifecycle stage. We use it as a FLOOR for the
+    // returned failure_stage so a crash that happened post-admission
+    // never gets demoted to `joining` just because the reason string
+    // looks early-stage.
+    //
+    // Hard cases (validation_error, missing_meeting_url) still pin to
+    // `requested` because by definition they fire before any callback
+    // emission has advanced the tracker.
+    const trackedStage = getCurrentLifecycleStage();
     switch (reason) {
-      case "teams_error":
-      case "google_meet_error":
-      case "zoom_error":
-        return { status: "failed", failureStage: "joining" };
-      case "post_join_setup_error":
-        return { status: "failed", failureStage: "joining" };
       case "missing_meeting_url":
         return { status: "failed", failureStage: "requested" };
       case "validation_error":
         return { status: "failed", failureStage: "requested" };
+      case "teams_error":
+      case "google_meet_error":
+      case "zoom_error":
+      case "post_join_setup_error":
+        // These can fire at any post-requested stage; trust the tracker.
+        // (Pre-#294 these all returned "joining" regardless of when they
+        // actually fired, mislabeling every active-stage crash as joining.)
+        return { status: "failed", failureStage: trackedStage };
       default:
-        return { status: "failed", failureStage: "active" };
+        return { status: "failed", failureStage: trackedStage };
     }
   }
 }

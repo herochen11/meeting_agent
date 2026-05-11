@@ -2,7 +2,7 @@
 Unit tests for _parse_meeting_url and Platform.construct_meeting_url.
 
 Run with: pytest services/mcp/test_parse_meeting_url.py -v
-  (from the repo root, with shared-models installed or on PYTHONPATH)
+  (from the repo root, with meeting-api on PYTHONPATH)
 """
 import hashlib
 import sys
@@ -11,11 +11,11 @@ import pytest
 
 # Allow running from repo root without installing the package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "libs", "shared-models"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "packages", "meeting-api"))
 
 from fastapi import HTTPException
 from main import _parse_meeting_url
-from shared_models.schemas import Platform
+from meeting_api.schemas import Platform
 
 
 # ---------------------------------------------------------------------------
@@ -286,29 +286,29 @@ class TestConstructMeetingUrl:
 
 class TestPasscodeValidation:
     def test_teams_4_char_passcode_accepted(self):
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         mc = MeetingCreate(platform="teams", native_meeting_id="9361792952021", passcode="ab12")
         assert mc.passcode == "ab12"
 
     def test_teams_6_char_passcode_accepted(self):
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         mc = MeetingCreate(platform="teams", native_meeting_id="9361792952021", passcode="IXw5Jh")
         assert mc.passcode == "IXw5Jh"
 
     def test_teams_20_char_passcode_accepted(self):
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         mc = MeetingCreate(platform="teams", native_meeting_id="9361792952021", passcode="A" * 20)
         assert mc.passcode == "A" * 20
 
     def test_teams_3_char_passcode_rejected(self):
         from pydantic import ValidationError
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         with pytest.raises(ValidationError):
             MeetingCreate(platform="teams", native_meeting_id="9361792952021", passcode="ab1")
 
     def test_teams_21_char_passcode_rejected(self):
         from pydantic import ValidationError
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         with pytest.raises(ValidationError):
             MeetingCreate(platform="teams", native_meeting_id="9361792952021", passcode="A" * 21)
 
@@ -319,23 +319,23 @@ class TestPasscodeValidation:
 
 class TestTeamsNativeMeetingIdValidation:
     def test_numeric_id_accepted(self):
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         mc = MeetingCreate(platform="teams", native_meeting_id="9361792952021")
         assert mc.native_meeting_id == "9361792952021"
 
     def test_hex_hash_accepted(self):
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         mc = MeetingCreate(platform="teams", native_meeting_id="a3f7c2d891b04e5f")
         assert mc.native_meeting_id == "a3f7c2d891b04e5f"
 
     def test_full_url_rejected(self):
         from pydantic import ValidationError
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         with pytest.raises(ValidationError):
             MeetingCreate(platform="teams", native_meeting_id="https://teams.microsoft.com/meet/123")
 
     def test_short_id_rejected(self):
         from pydantic import ValidationError
-        from shared_models.schemas import MeetingCreate
+        from meeting_api.schemas import MeetingCreate
         with pytest.raises(ValidationError):
             MeetingCreate(platform="teams", native_meeting_id="12345")

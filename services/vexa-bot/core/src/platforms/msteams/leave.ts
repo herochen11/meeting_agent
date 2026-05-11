@@ -1,7 +1,9 @@
 import { Page } from "playwright";
 import { log, callLeaveCallback } from "../../utils";
+import { logJSON } from "../../utils/log";
 import { BotConfig } from "../../types";
 import { teamsLeaveSelectors, teamsPrimaryHangupButtonSelector } from "./selectors";
+import { stopTeamsRecording } from "./recording";
 
 // Prepare for recording by exposing necessary functions
 export async function prepareForRecording(page: Page, botConfig: BotConfig): Promise<void> {
@@ -18,7 +20,7 @@ export async function prepareForRecording(page: Page, botConfig: BotConfig): Pro
     if (typeof (window as any).performLeaveAction !== "function") {
       (window as any).performLeaveAction = async () => {
         try {
-          // Call leave callback first to notify bot-manager
+          // Call leave callback first to notify meeting-api
           (window as any).logBot?.("🔥 Calling leave callback before attempting to leave...");
           try {
             const botConfig = (window as any).getBotConfig?.();
@@ -101,31 +103,49 @@ export async function leaveMicrosoftTeams(page: Page | null, botConfig?: BotConf
     return false;
   }
 
-  // Flush browser-side recording blob before callback/leave path.
-  // This ensures Teams audio is persisted before upload is attempted.
+  // Pack U.3 (v0.10.6): drain the unified recording pipeline before UI leave.
+  // This stops the browser-side MediaRecorder, emits the final isFinal=true
+  // chunk, and waits for the upload queue to drain so meeting-api flips
+  // Recording.status to COMPLETED before the bot exits. Replaces the old
+  // __vexaFlushRecordingBlob full-blob path (dead under chunked upload).
   try {
-    log("[leaveMicrosoftTeams] Flushing browser recording blob before leave...");
-    await page.evaluate(async () => {
-      const flushFn = (window as any).__vexaFlushRecordingBlob;
-      if (typeof flushFn === "function") {
-        await flushFn("manual_leave");
-      }
-    });
+    log("[leaveMicrosoftTeams] Stopping recording pipeline before leave...");
+    await stopTeamsRecording();
   } catch (flushError: any) {
-    log(`[leaveMicrosoftTeams] Recording flush failed: ${flushError.message}`);
+    // v0.10.5 Pack G.1 — recording-flush failure means the final chunk
+    // never made it; chunks already in MinIO are still durable, but the
+    // recording_finalizer won't see is_final=true and the meeting Recording
+    // row will stay IN_PROGRESS until reconciler cleanup.
+    logJSON({
+      level: "error",
+      msg: "[leaveMicrosoftTeams] Recording pipeline stop failed",
+      error_message: flushError?.message,
+      error_name: flushError?.name,
+      error_stack: flushError?.stack,
+      leave_reason: reason,
+    });
   }
 
-  // Call leave callback first to notify bot-manager
+  // Call leave callback first to notify meeting-api
   if (botConfig) {
     try {
-      log("🔥 Calling leave callback before attempting to leave...");
+      log("[leaveMicrosoftTeams] Calling leave callback before attempting to leave");
       await callLeaveCallback(botConfig, reason);
-      log("✅ Leave callback sent successfully");
+      log("[leaveMicrosoftTeams] Leave callback sent successfully");
     } catch (callbackError: any) {
-      log(`⚠️ Warning: Failed to send leave callback: ${callbackError.message}. Continuing with leave attempt...`);
+      logJSON({
+        level: "warn",
+        msg: "[leaveMicrosoftTeams] Leave callback failed; continuing with leave attempt",
+        error_message: callbackError?.message,
+        error_name: callbackError?.name,
+        leave_reason: reason,
+      });
     }
   } else {
-    log("⚠️ Warning: No bot config provided, cannot send leave callback");
+    logJSON({
+      level: "warn",
+      msg: "[leaveMicrosoftTeams] No bot config provided; cannot send leave callback",
+    });
   }
 
   try {

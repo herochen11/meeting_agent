@@ -1202,11 +1202,38 @@ export function getVirtualCameraInitScript(): string {
         // Disable incoming video to save CPU/memory.
         // The bot only needs audio for transcription — receiving and rendering
         // all participants' video wastes ~87% CPU and ~2GB RAM per bot.
+        // track.enabled=false hides rendering and is the safe disabling primitive.
+        // Deferred via setTimeout(0) so Google Meet's track handlers create DOM
+        // elements first — the audio capture pipeline needs those elements.
+        //
+        // v0.10.6 (#291): the transceiver.direction mutation that previously lived
+        // here was the second of two duplicate sites of the SDP-munge bug fixed
+        // by v0.10.5 commit 8ab7f49 (which only reverted site 1 in
+        // getVideoBlockInitScript). Mutating transceiver.direction at this point
+        // produces a malformed offer SDP (BUNDLE enabled but rtcp-mux missing on
+        // m=video). Chrome rejects setLocalDescription with InvalidAccessError,
+        // peer enters degraded state, eventually the page navigates and
+        // page.evaluate context is destroyed. Symptoms: GMeet recording_enabled
+        // mid-meeting crash (#284), GMeet 14-min variant when a new track event
+        // fires (#291), Teams 44ms post-admission drop (#281). Same code path
+        // also reachable from Zoom Web (zoom/web/prepare.ts:198-199) and Teams
+        // (msteams/join.ts:144). One fix, three platforms.
+        //
+        // (Note: this comment lives inside a template literal returned by
+        //  getVirtualCameraInitScript, so backticks and dollar-curly braces
+        //  must NOT appear here. Plain text only.)
+        //
+        // Conclusion: track.enabled=false is sufficient. Don't mutate
+        // transceiver.direction here.
         if (!window.__vexa_voice_agent_enabled) {
           pc.addEventListener('track', (event) => {
             if (event.track && event.track.kind === 'video') {
-              event.track.enabled = false;
-              console.log('[Vexa] Incoming video track disabled (id=' + event.track.id + ')');
+              const trackId = event.track.id;
+              const trackRef = event.track;
+              setTimeout(() => {
+                trackRef.enabled = false;
+                console.log('[Vexa] Incoming video track disabled (deferred, id=' + trackId + ')');
+              }, 0);
             }
           });
         }
@@ -1253,12 +1280,17 @@ export function getVirtualCameraInitScript(): string {
 /**
  * Lightweight init script for transcription-only bots (no avatar/voice agent).
  * Only patches RTCPeerConnection to:
- * 1. Disable incoming video tracks (track.enabled = false)
- * 2. Stop video transceivers to prevent Chrome from decoding video
- * 3. Block outgoing video by setting video transceiver direction to 'inactive'
+ * 1. Disable incoming video tracks (track.enabled = false) after a short delay
+ * 2. Preserve audio tracks so the audio capture pipeline can find media elements
  *
  * This avoids the heavy virtual camera setup (canvas, getUserMedia, addTrack patches)
  * while still reducing CPU/memory from incoming video decoding.
+ *
+ * IMPORTANT: Video track disabling is deferred via setTimeout so that Google Meet's
+ * own track handlers run first and attach the MediaStream to DOM elements (<video>).
+ * Without this delay, Google Meet sees the disabled video track synchronously and
+ * skips creating media elements, which breaks audio capture (the audio pipeline
+ * discovers audio by finding <audio>/<video> elements with srcObject.getAudioTracks()).
  */
 export function getVideoBlockInitScript(): string {
   return `
@@ -1274,23 +1306,71 @@ export function getVideoBlockInitScript(): string {
         window.RTCPeerConnection = function(...args) {
           const pc = new OrigRTC(...args);
 
-          // Block incoming video: disable tracks AND stop transceivers
+          // Block incoming video. Two layers, deferred via setTimeout so the
+          // platform's own ontrack runs first and creates the DOM <audio>/
+          // <video> elements (audio capture relies on finding those elements
+          // via querySelectorAll('audio, video') + srcObject.getAudioTracks()).
+          //
+          //   1. track.enabled=false — makes <video> tags emit black frames.
+          //      Sufficient for gmeet/teams which render video via standard
+          //      <video> elements. INSUFFICIENT for Zoom Web which renders
+          //      via canvas decoded in Worker contexts: the decoder keeps
+          //      pumping frames even when the <video> output is disabled,
+          //      so the canvas paint is unaffected.
+          //
+          //   2. transceiver.direction → 'sendonly' (was sendrecv) or
+          //      'inactive' (was recvonly). This actually stops WebRTC from
+          //      pulling decoded frames for the disabled track — which is
+          //      what stops Zoom's canvas paint, and what frees the heavy
+          //      decoder Worker on all platforms. 'sendonly' (not 'inactive')
+          //      keeps the connection symmetric so Zoom doesn't kick the
+          //      bot on renegotiation; 'inactive' is only used when the
+          //      connection was already recv-only.
+          //
+          // Same pattern getVirtualCameraInitScript uses when virtual camera
+          // is on — it just wasn't being applied in the simpler block-only
+          // path until 2026-04-26 (Zoom Web cycle 260426: user observed
+          // participant video still rendering in bot's VNC view despite
+          // track.enabled=false succeeding).
           pc.addEventListener('track', (event) => {
             if (event.track && event.track.kind === 'video') {
-              event.track.enabled = false;
-              event.track.stop();
-              console.log('[Vexa] Incoming video track stopped (id=' + event.track.id + ')');
-
-              // Also set the transceiver to recvonly->inactive to tell the
-              // remote peer we don't want video at all
-              if (event.transceiver) {
+              const trackId = event.track.id;
+              const trackRef = event.track;
+              // RTCTrackEvent.transceiver is a direct reference — no need
+              // to scan pc.getTransceivers() and compare track refs (which
+              // can fail when Zoom's WebRTC wraps tracks). Captured here in
+              // the synchronous handler in case the transceiver list mutates
+              // by the time setTimeout fires. Note: this string template is
+              // injected into the browser as JS, so it MUST be plain JS — no
+              // TypeScript type annotations (those would survive tsc's pass
+              // through the template literal and cause a SyntaxError in the
+              // browser, killing the whole IIFE silently).
+              // v0.10.5 — DO NOT modify transceiver.direction.
+              //
+              // Pre-fix: setting direction to 'inactive'/'sendonly' triggered
+              // WebRTC renegotiation that produced a malformed offer SDP
+              // (BUNDLE enabled but rtcp-mux missing on the m=video line);
+              // setLocalDescription threw InvalidAccessError, the peer entered
+              // a degraded state, and ~60-90s later GMeet severed the session
+              // → page navigated to workspace.google.com/products/meet/ →
+              // page.evaluate context destroyed → bot exited as
+              // post_join_setup_error. This was the dominant GMeet failure
+              // mode in prod (~44% of meetings 2026-04-30 24h).
+              //
+              // Just disable the track. This stops rendering (sufficient
+              // for gmeet/teams which use standard <video> elements). The
+              // decoder cost we were trying to avoid was largely mitigated
+              // by v0.10.4's --in-process-gpu flag; revisit with launch-flag
+              // codec disable (--disable-features=Vp8,Vp9) if memory pressure
+              // returns. Do NOT munge SDP from inside page.evaluate — see
+              // attendee project for the system-level capture paradigm
+              // that sidesteps this entire bug class.
+              setTimeout(() => {
                 try {
-                  event.transceiver.direction = 'inactive';
-                  console.log('[Vexa] Video transceiver set to inactive (mid=' + event.transceiver.mid + ')');
-                } catch (e) {
-                  console.warn('[Vexa] Could not set transceiver direction:', e);
-                }
-              }
+                  trackRef.enabled = false;
+                } catch (e) { /* ignore */ }
+                console.log('[Vexa] Incoming video track disabled (track.enabled=false only, no SDP munge, id=' + trackId + ')');
+              }, 0);
             }
           });
 
@@ -1300,6 +1380,15 @@ export function getVideoBlockInitScript(): string {
         Object.keys(OrigRTC).forEach(key => {
           try { window.RTCPeerConnection[key] = OrigRTC[key]; } catch {}
         });
+
+        // Note (cycle 260426 Zoom Web): tried prototype-level
+        // setRemoteDescription patch + SDP-munge to set m=video sections
+        // to a=inactive — fires for one PC but Zoom retries / ignores
+        // the inactive direction and CPU usage actually spikes (~440%
+        // vs ~270% baseline). Approach reverted; carrying as Wave-2
+        // research item. Real fix likely requires intercepting Zoom's
+        // custom video-rendering layer or running Zoom Web behind a
+        // network-level video filter.
 
         console.log('[Vexa] RTCPeerConnection patched for video blocking (transcription-only)');
       } catch (e) {

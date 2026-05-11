@@ -6,8 +6,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "tsc && node build-browser-utils.js",
+    "test": "tsx src/platforms/zoom/web/join.test.ts",
+    "build": "tsc && cp -r src/services/hallucinations dist/services/hallucinations && node build-browser-utils.js",
     "build-browser": "node build-browser-utils.js",
     "dev": "tsx src/index.ts"
   },
@@ -15,8 +15,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@jjhbw/silero-vad": "^1.0.3",
     "@types/uuid": "^10.0.0",
-    "playwright": "^1.55.1",
+    "basic-ftp": "^5.3.0",
+    "onnxruntime-node": "^1.24.3",
+    "playwright": "1.56.0",
     "playwright-extra": "^4.3.6",
     "puppeteer": "^24.4.0",
     "puppeteer-extra": "^3.3.6",

@@ -1,466 +1,444 @@
-.PHONY: all setup submodules env force-env setup-transcription-service-env build-bot-image build build-transcription-service up up-transcription-service down down-transcription-service ps logs test test-api test-setup migrate makemigrations init-db stamp-db migrate-or-init migration-status
+.PHONY: all lite build up down lite-down docs docs-dev smoke test what-changed full \
+       collect score \
+       vm-compose vm-lite vm-destroy vm-ssh \
+       release-build release-test release-validate release-ship release-promote \
+       help
 
-# Default target: Sets up everything and starts the services
-all: setup-env build up migrate-or-init test
+# ═══ Deploy ═════════════════════════════════════════════════════
 
-# Target to set up only the environment without Docker
-setup-env: env submodules
+all:                               ## full stack via Docker Compose
+	@$(MAKE) --no-print-directory -C deploy/compose all
 
-# Target to perform all initial setup steps
-setup: setup-env build-bot-image
+lite:                              ## single-container deploy (Vexa Lite)
+	@$(MAKE) --no-print-directory -C deploy/lite all
 
-# Initialize and update Git submodules
-submodules:
-	@git submodule update --init --recursive
+build:                             ## build all images from source
+	@$(MAKE) --no-print-directory -C deploy/compose build
 
-BOT_IMAGE_NAME ?= vexa-bot:dev
+up:                                ## start compose stack (alias for all)
+	@$(MAKE) --no-print-directory -C deploy/compose all
 
-# Check if Docker daemon is running
-check_docker:
-	@if ! docker info > /dev/null 2>&1; then \
-		echo "ERROR: Docker is not running. Please start Docker Desktop or Docker daemon first."; \
-		exit 1; \
-	fi
+down:                              ## stop compose stack
+	@$(MAKE) --no-print-directory -C deploy/compose down
 
--include .env
+lite-down:                         ## stop lite containers
+	@$(MAKE) --no-print-directory -C deploy/lite down
 
-# Helper: Get COMPOSE_FILES based on REMOTE_DB
-# Usage: $(call get_compose_files)
-get_compose_files = $(shell REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		echo "-f docker-compose.yml -f docker-compose.local-db.yml"; \
+# ═══ Test ════════════════════════════════════════════════════════
+
+docs:                              ## check docs for drift (static, 0s)
+	@$(MAKE) --no-print-directory -C tests3 docs
+
+docs-dev:                          ## start mintlify dev server on localhost:3000
+	@$(MAKE) --no-print-directory -C docs dev
+
+smoke:                             ## run all checks (~30s)
+	@$(MAKE) --no-print-directory -C tests3 smoke
+
+test:                              ## resolve changed files → run affected tests
+	@$(MAKE) --no-print-directory -C tests3 what-changed
+	@TARGETS=$$(git diff --name-only $${BASE:-main} | python3 tests3/resolve.py 2>/dev/null); \
+	if [ -n "$$TARGETS" ]; then \
+		$(MAKE) --no-print-directory -C tests3 $$TARGETS; \
 	else \
-		echo "-f docker-compose.yml"; \
-	fi)
-
-# Ensure transcription-service/.env exists with API_TOKEN
-setup-transcription-service-env:
-	@if [ "$(TRANSCRIPTION)" = "remote" ]; then \
-		exit 0; \
-	fi; \
-	if [ ! -f services/transcription-service/.env ]; then \
-		if [ -f services/transcription-service/.env.example ]; then \
-			cp services/transcription-service/.env.example services/transcription-service/.env; \
-		else \
-			echo "# API Token for securing the service" > services/transcription-service/.env; \
-			echo "API_TOKEN=$$(openssl rand -hex 16)" >> services/transcription-service/.env; \
-		fi; \
-	fi; \
-	TRANSCRIPTION_API_TOKEN=$$(grep -E '^[[:space:]]*API_TOKEN=' services/transcription-service/.env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo ""); \
-	if [ -z "$$TRANSCRIPTION_API_TOKEN" ] || [ "$$TRANSCRIPTION_API_TOKEN" = "your_secure_token_here" ]; then \
-		NEW_TOKEN=$$(openssl rand -hex 16); \
-		if grep -q "^API_TOKEN=" services/transcription-service/.env 2>/dev/null; then \
-			sed -i.bak "s/^API_TOKEN=.*/API_TOKEN=$$NEW_TOKEN/" services/transcription-service/.env; \
-			rm -f services/transcription-service/.env.bak; \
-		else \
-			echo "API_TOKEN=$$NEW_TOKEN" >> services/transcription-service/.env; \
-		fi; \
-	fi; \
-	MAKE_TRANSCRIPTION=$${TRANSCRIPTION:-remote}; \
-	if [ "$$MAKE_TRANSCRIPTION" = "gpu" ]; then \
-		python3 scripts/update_transcription_service_env.py --file services/transcription-service/.env --device cuda --compute-type float16 >/dev/null 2>&1; \
-	elif [ "$$MAKE_TRANSCRIPTION" = "cpu" ]; then \
-		python3 scripts/update_transcription_service_env.py --file services/transcription-service/.env --device cpu --compute-type int8 >/dev/null 2>&1; \
+		echo "No test targets affected. Running smoke."; \
+		$(MAKE) --no-print-directory -C tests3 smoke; \
 	fi
 
-# Helper function to create env file for a target
-# Usage: $(call create_env_file,cpu|gpu|remote,force)
-define create_env_file
-	TRANSCRIPTION_TYPE=$(1); FORCE=$(2); \
-	if [ "$$FORCE" != "force" ] && [ -f .env ]; then \
-		echo ".env exists. Use 'make force-env TRANSCRIPTION=$$TRANSCRIPTION_TYPE' to overwrite."; \
-		exit 0; \
-	fi; \
-	if [ "$$TRANSCRIPTION_TYPE" = "cpu" ]; then \
-		ENV_FILE=env-example.cpu; \
-		URL=http://transcription-lb-cpu:80/v1/audio/transcriptions; \
-	elif [ "$$TRANSCRIPTION_TYPE" = "gpu" ]; then \
-		ENV_FILE=env-example.gpu; \
-		URL=http://transcription-lb:80/v1/audio/transcriptions; \
-	elif [ "$$TRANSCRIPTION_TYPE" = "remote" ]; then \
-		ENV_FILE=env-example.remote; \
-		URL=https://transcription-service.dev.vexa.ai/v1/audio/transcriptions; \
-	else \
-		echo "Error: Invalid TRANSCRIPTION_TYPE=$$TRANSCRIPTION_TYPE. Must be 'cpu', 'gpu', or 'remote'"; \
-		exit 1; \
-	fi; \
-	if [ ! -f $$ENV_FILE ]; then \
-		echo "ADMIN_API_TOKEN=token" > $$ENV_FILE; \
-		echo "LANGUAGE_DETECTION_SEGMENTS=10" >> $$ENV_FILE; \
-		echo "VAD_FILTER_THRESHOLD=0.5" >> $$ENV_FILE; \
-		if [ "$$TRANSCRIPTION_TYPE" = "remote" ]; then \
-			echo "WHISPER_MODEL_SIZE=medium" >> $$ENV_FILE; \
-			echo "DEVICE_TYPE=remote" >> $$ENV_FILE; \
-			echo "WL_MAX_CLIENTS=10" >> $$ENV_FILE; \
-		else \
-			echo "DEVICE_TYPE=remote" >> $$ENV_FILE; \
-		fi; \
-		echo "BOT_IMAGE_NAME=vexa-bot:dev" >> $$ENV_FILE; \
-		echo "# Remote Transcriber API Configuration" >> $$ENV_FILE; \
-		echo "REMOTE_TRANSCRIBER_URL=$$URL" >> $$ENV_FILE; \
-		TRANSCRIPTION_API_TOKEN=$$(grep -E '^[[:space:]]*API_TOKEN=' services/transcription-service/.env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo ""); \
-		if [ -n "$$TRANSCRIPTION_API_TOKEN" ] && [ "$$TRANSCRIPTION_TYPE" != "remote" ]; then \
-			echo "REMOTE_TRANSCRIBER_API_KEY=$$TRANSCRIPTION_API_TOKEN" >> $$ENV_FILE; \
-		else \
-			if [ "$$TRANSCRIPTION_TYPE" = "remote" ]; then \
-				echo "REMOTE_TRANSCRIBER_API_KEY=your_api_key_here" >> $$ENV_FILE; \
-				echo "REMOTE_TRANSCRIBER_MODEL=whisper-v3-turbo" >> $$ENV_FILE; \
-				echo "REMOTE_TRANSCRIBER_TEMPERATURE=0" >> $$ENV_FILE; \
-				echo "REMOTE_TRANSCRIBER_VAD_MODEL=silero" >> $$ENV_FILE; \
-			else \
-				echo "REMOTE_TRANSCRIBER_API_KEY=" >> $$ENV_FILE; \
-			fi; \
-		fi; \
-		echo "# Exposed Host Ports" >> $$ENV_FILE; \
-		echo "API_GATEWAY_HOST_PORT=8056" >> $$ENV_FILE; \
-		echo "ADMIN_API_HOST_PORT=8057" >> $$ENV_FILE; \
-		echo "TRANSCRIPTION_COLLECTOR_HOST_PORT=8123" >> $$ENV_FILE; \
-		echo "POSTGRES_HOST_PORT=5438" >> $$ENV_FILE; \
-		echo "# Remote Database Configuration" >> $$ENV_FILE; \
-		echo "# Set REMOTE_DB=true to use remote PostgreSQL instead of local Docker postgres" >> $$ENV_FILE; \
-		if [ "$$TRANSCRIPTION_TYPE" = "remote" ]; then \
-			echo "# When REMOTE_DB=true: Uncomment and set the remote database credentials below" >> $$ENV_FILE; \
-			echo "# DB_HOST=your-remote-db-host" >> $$ENV_FILE; \
-			echo "# DB_PORT=5432" >> $$ENV_FILE; \
-			echo "# DB_NAME=your-db-name" >> $$ENV_FILE; \
-			echo "# DB_USER=your-db-user" >> $$ENV_FILE; \
-			echo "# DB_PASSWORD=your-db-password" >> $$ENV_FILE; \
-		fi; \
-		echo "REMOTE_DB=false" >> $$ENV_FILE; \
-		if [ "$$TRANSCRIPTION_TYPE" != "remote" ]; then \
-			echo "# Docker-compose compatibility (not used in remote mode)" >> $$ENV_FILE; \
-			echo "WHISPER_MODEL_SIZE=" >> $$ENV_FILE; \
-			echo "WL_MAX_CLIENTS=" >> $$ENV_FILE; \
-		fi; \
-	fi; \
-	cp $$ENV_FILE .env; \
-	if [ "$$TRANSCRIPTION_TYPE" != "remote" ]; then \
-		TRANSCRIPTION_API_TOKEN=$$(grep -E '^[[:space:]]*API_TOKEN=' services/transcription-service/.env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo ""); \
-		if [ -n "$$TRANSCRIPTION_API_TOKEN" ] && [ "$$TRANSCRIPTION_TYPE" != "remote" ]; then \
-			if grep -q "^REMOTE_TRANSCRIBER_API_KEY=" .env 2>/dev/null; then \
-				sed -i.bak "s|^REMOTE_TRANSCRIBER_API_KEY=.*|REMOTE_TRANSCRIBER_API_KEY=$$TRANSCRIPTION_API_TOKEN|" .env; \
-				rm -f .env.bak; \
-			else \
-				echo "REMOTE_TRANSCRIBER_API_KEY=$$TRANSCRIPTION_API_TOKEN" >> .env; \
-			fi; \
-		fi; \
-	fi; \
-	if [ "$$TRANSCRIPTION_TYPE" = "remote" ]; then \
-		echo ""; \
-		echo "============================================================================"; \
-		echo "IMPORTANT: Manual API Key Required"; \
-		echo "============================================================================"; \
-		echo "You are using remote transcription service (TRANSCRIPTION=remote)."; \
-		echo "Please set REMOTE_TRANSCRIBER_API_KEY in .env file with your API key from staging.vexa.ai"; \
-		echo ""; \
-		echo "To deploy a local transcription service instead, use:"; \
-		echo "  make force-env TRANSCRIPTION=cpu   # For CPU-based local transcription"; \
-		echo "  make force-env TRANSCRIPTION=gpu   # For GPU-based local transcription"; \
-		echo "============================================================================"; \
-		echo ""; \
+what-changed:                      ## show which tests would run (dry-run)
+	@$(MAKE) --no-print-directory -C tests3 what-changed
+
+full:                              ## run everything
+	@$(MAKE) --no-print-directory -C tests3 full
+
+# ═══ Data collection ════════════════════════════════════════════
+
+collect:                           ## collect dataset from live meeting (CONVERSATION=3speakers)
+	@$(MAKE) --no-print-directory -C tests3 collect CONVERSATION=$${CONVERSATION:-3speakers}
+
+score:                             ## re-score existing dataset offline (DATASET=gmeet-compose-260405)
+	@$(MAKE) --no-print-directory -C tests3 score DATASET=$${DATASET}
+
+# ═══ VM ══════════════════════════════════════════════════════════
+
+vm-compose:                        ## fresh VM + compose + smoke
+	@$(MAKE) --no-print-directory -C tests3 vm-compose
+
+vm-lite:                           ## fresh VM + lite + smoke
+	@$(MAKE) --no-print-directory -C tests3 vm-lite
+
+vm-destroy:                        ## tear down VM
+	@$(MAKE) --no-print-directory -C tests3 vm-destroy
+
+vm-ssh:                            ## SSH into VM
+	@$(MAKE) --no-print-directory -C tests3 vm-ssh
+
+# ═══ Release ═════════════════════════════════════════════════════
+
+release-build:                     ## build + publish :dev to DockerHub + record tag
+	@$(MAKE) --no-print-directory -C deploy/compose build
+	@$(MAKE) --no-print-directory -C deploy/compose publish
+	@# Record the freshly-built tag so release-test can propagate it into per-mode state
+	@# (deploy/compose/.last-tag is written by the publish step)
+	@mkdir -p tests3/.state tests3/.state-lite tests3/.state-compose tests3/.state-helm
+	@if [ -f deploy/compose/.last-tag ]; then \
+		TAG=$$(cat deploy/compose/.last-tag); \
+		echo "$$TAG" > tests3/.state/image_tag; \
+		echo "$$TAG" > tests3/.state-lite/image_tag; \
+		echo "$$TAG" > tests3/.state-compose/image_tag; \
+		echo "$$TAG" > tests3/.state-helm/image_tag; \
 	fi
+
+## ─────────────────────────────────────────────────────────────────────
+## Release cycle — stage state machine (see tests3/README.md §5.5)
+##
+##   0. idle                 — dormant; no active release
+##   0a. release-worktree    — create ../vexa-<id> git worktree so N
+##                             releases run in parallel from one clone
+##                             (#229). Run from the main checkout; then
+##                             cd into the worktree for every step below.
+##   1. release-groom        — cluster issues → groom.md (AI, stage 01)
+##   2. release-plan         — scaffold scope.yaml + plan-approval.yaml (stage 02)
+##   3. release-provision    — VMs + LKE (stage 04)
+##   4. release-deploy       — build :dev + push + redeploy (stage 05)
+##   5. release-validate     — three-phase validate → Gate verdict (stage 06)
+##        on red  → release-triage
+##        on green → release-human
+##   6. release-triage       — classify regression vs gap (stage 07)
+##   7. release-human        — code review + bounded eyeroll (stage 08)
+##   8. release-ship         — merge dev→main; promote :latest (stage 09)
+##   9. release-teardown     — destroy infra (stage 10)
+##
+## Every target asserts stage before acting, transitions stage on success.
+## Scope drives: SCOPE=tests3/releases/<id>/scope.yaml
+## ─────────────────────────────────────────────────────────────────────
+
+# Resolve which modes this scope touches (used by every stage below).
+define _SCOPE_MODES
+$$(python3 -c "import yaml,sys; s=yaml.safe_load(open('$(SCOPE)')); print(' '.join(s['deployments']['modes']))")
 endef
 
-# Create .env file from example
-env: setup-transcription-service-env
-ifndef TRANSCRIPTION
-	$(eval TRANSCRIPTION := remote)
-endif
-	@if [ "$(TRANSCRIPTION)" = "cpu" ] || [ "$(TRANSCRIPTION)" = "gpu" ] || [ "$(TRANSCRIPTION)" = "remote" ]; then \
-		$(call create_env_file,$(TRANSCRIPTION),); \
-	else \
-		echo "Error: TRANSCRIPTION must be 'cpu', 'gpu', or 'remote'"; \
-		exit 1; \
-	fi
+# Stage helper — every release-* target calls this before + after work.
+_STAGE = python3 $(CURDIR)/tests3/lib/stage.py
 
-# Force create .env file from example (overwrite existing)
-force-env: setup-transcription-service-env
-ifndef TRANSCRIPTION
-	$(eval TRANSCRIPTION := remote)
-endif
-	@if [ "$(TRANSCRIPTION)" = "cpu" ] || [ "$(TRANSCRIPTION)" = "gpu" ] || [ "$(TRANSCRIPTION)" = "remote" ]; then \
-		$(call create_env_file,$(TRANSCRIPTION),force); \
-	else \
-		echo "Error: TRANSCRIPTION must be 'cpu', 'gpu', or 'remote'"; \
-		exit 1; \
-	fi
+stage:                             ## print current stage + next
+	@$(_STAGE) probe
 
-# Build the standalone vexa-bot image
-build-bot-image: check_docker
-	@if [ -f .env ]; then \
-		ENV_BOT_IMAGE_NAME=$$(grep BOT_IMAGE_NAME .env | cut -d= -f2); \
-		if [ -n "$$ENV_BOT_IMAGE_NAME" ]; then \
-			docker build --platform linux/amd64 -t $$ENV_BOT_IMAGE_NAME -f services/vexa-bot/Dockerfile ./services/vexa-bot; \
+release-worktree:                  ## stage 00→ bootstrap: create ../vexa-<id> worktree + seed idle
+	@ID=$${ID:?set ID=<YYMMDD-slug>, e.g. ID=260418-webhooks}; \
+	bash $(CURDIR)/tests3/lib/worktree.sh create $$ID
+
+release-groom:                     ## stage 01: cluster issues → releases/<id>/groom.md
+	@$(_STAGE) assert-is idle
+	@ID=$${ID:?set ID=<YYMMDD-slug>, e.g. ID=260418-webhooks}; \
+	mkdir -p tests3/releases/$$ID; \
+	touch tests3/releases/$$ID/groom.md; \
+	echo "  created tests3/releases/$$ID/groom.md"; \
+	$(_STAGE) enter groom --release $$ID --actor make:release-groom; \
+	echo "  → next: fill groom.md with issue packs; human approves at least one pack; then \`make release-plan SCOPE=tests3/releases/$$ID/scope.yaml\`"
+
+release-plan:                      ## stage 02: scaffold scope.yaml + plan-approval.yaml
+	@$(_STAGE) assert-is groom
+	@ID=$${ID:?set ID=<YYMMDD-slug>}; \
+	mkdir -p tests3/releases/$$ID; \
+	if [ -f tests3/releases/$$ID/scope.yaml ]; then \
+		echo "  scope already exists: tests3/releases/$$ID/scope.yaml"; \
+	else \
+		cp tests3/releases/_template/scope.yaml tests3/releases/$$ID/scope.yaml; \
+		sed -i "s/REPLACE-WITH-YYMMDD-SLUG/$$ID/" tests3/releases/$$ID/scope.yaml; \
+		echo "  created tests3/releases/$$ID/scope.yaml"; \
+	fi
+	@ID=$${ID:?}; touch tests3/releases/$$ID/plan-approval.yaml
+	@ID=$${ID:?}; $(_STAGE) enter plan --release $$ID --actor make:release-plan
+	@echo "  → fill scope.yaml + plan-approval.yaml (approved: true on every item) then \`make release-provision SCOPE=tests3/releases/$$ID/scope.yaml\`"
+
+# Stage 03 `develop` has no Makefile target — it's "humans write code" with
+# AI assist. The stage is entered by release-plan (once plan-approval is
+# signed) via a helper; for now it's entered manually via stage.py enter develop.
+
+release-provision:                 ## stage 04: provision VMs + LKE in parallel
+	@$(_STAGE) assert-is develop
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE=tests3/releases/<id>/scope.yaml" && exit 2)
+	@MODES="$(_SCOPE_MODES)"; echo "  provisioning modes: $$MODES"; \
+	mkdir -p tests3/.state-lite tests3/.state-compose tests3/.state-helm; \
+	for mode in $$MODES; do \
+		case $$mode in \
+			lite)    $(MAKE) --no-print-directory -C tests3 vm-provision-lite STATE=$(CURDIR)/tests3/.state-lite & ;; \
+			compose) $(MAKE) --no-print-directory -C tests3 vm-provision-compose STATE=$(CURDIR)/tests3/.state-compose & ;; \
+			helm)    $(MAKE) --no-print-directory -C tests3 lke-provision lke-setup STATE=$(CURDIR)/tests3/.state-helm & ;; \
+		esac; \
+	done; wait
+	@$(_STAGE) enter provision --actor make:release-provision
+
+release-deploy:                    ## stage 05: build + push :dev + redeploy to all provisioned modes
+	@python3 -c "import sys; from pathlib import Path; sys.path.insert(0,'tests3/lib'); import stage; s=stage.current(); sys.exit(0 if s.get('stage') in ('provision','develop') else (print(f\"stage must be provision or develop, got {s.get('stage')}\",file=sys.stderr) or 1))"
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@$(MAKE) --no-print-directory release-build
+	@MODES="$(_SCOPE_MODES)"; \
+	for mode in $$MODES; do \
+		case $$mode in \
+			lite)    $(MAKE) --no-print-directory -C tests3 vm-redeploy-lite STATE=$(CURDIR)/tests3/.state-lite & ;; \
+			compose) $(MAKE) --no-print-directory -C tests3 vm-redeploy-compose STATE=$(CURDIR)/tests3/.state-compose & ;; \
+			helm)    $(MAKE) --no-print-directory -C tests3 lke-upgrade STATE=$(CURDIR)/tests3/.state-helm & ;; \
+		esac; \
+	done; wait
+	@$(_STAGE) enter deploy --actor make:release-deploy
+
+release-validate:                  ## stage 06: three-phase validate → Gate verdict (green→human / red→triage)
+	@$(_STAGE) assert-is deploy
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	# Enter `validate` BEFORE running the matrix. Without this, the
+	# transition deploy→triage on red is illegal (triage's legal
+	# predecessors are {validate, human} per stage.py:55) — the recipe
+	# would fail with "illegal transition 'deploy' → 'triage'" even
+	# though the matrix produced a clean red verdict. v0.10.5 R4 fix.
+	@$(_STAGE) enter validate --actor make:release-validate --reason "begin gate matrix"
+	@$(MAKE) --no-print-directory release-full SCOPE=$(SCOPE) && \
+		($(_STAGE) enter human --actor make:release-validate --reason "gate green" && echo "  → stage: human") || \
+		($(_STAGE) enter triage --actor make:release-validate --reason "gate red" && echo "  → stage: triage" && exit 1)
+
+release-triage:                    ## stage 07: classify failures as regression vs gap
+	@$(_STAGE) assert-is triage
+	@echo "  invoke the triage skill (or do it by hand): write tests3/releases/<id>/triage-log.md"
+	@echo "  once human writes 'fix this first: <DoD-id>' run: python3 tests3/lib/stage.py enter develop --reason 'triage picked next fix'"
+
+release-iterate:                   ## stage 06 fast variant — scope-filtered tests (dev loop, not authoritative)
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@MODES="$(_SCOPE_MODES)"; \
+	mkdir -p tests3/.state; cp -f $(SCOPE) tests3/.state/scope.yaml; \
+	for mode in $$MODES; do \
+		case $$mode in \
+			lite)    $(MAKE) --no-print-directory -C tests3 vm-validate-scope-lite STATE=$(CURDIR)/tests3/.state-lite SCOPE=$(CURDIR)/$(SCOPE) & ;; \
+			compose) $(MAKE) --no-print-directory -C tests3 vm-validate-scope-compose STATE=$(CURDIR)/tests3/.state-compose SCOPE=$(CURDIR)/$(SCOPE) & ;; \
+			helm)    $(MAKE) --no-print-directory -C tests3 validate-helm STATE=$(CURDIR)/tests3/.state-helm SCOPE=$(CURDIR)/$(SCOPE) & ;; \
+		esac; \
+	done; wait
+	@$(MAKE) --no-print-directory release-report
+
+hot-iterate:                       ## dev loop — rebuild ONE image, recreate on compose only, run scope tests (~5min vs ~30min)
+	@test -n "$(SERVICE)" || (echo "  ERROR: set SERVICE=<vexa-bot|dashboard|meeting-api|runtime-api|admin-api|api-gateway|mcp|tts-service|vexa-lite>" && exit 2)
+	@bash $(CURDIR)/tests3/lib/hot-iterate.sh "$(SERVICE)" "$(SCOPE)"
+
+release-reset:                     ## stage 6a: wipe stack+volumes on all provisioned modes (keeps VMs/cluster)
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@MODES="$(_SCOPE_MODES)"; \
+	for mode in $$MODES; do \
+		case $$mode in \
+			lite)    $(MAKE) --no-print-directory -C tests3 vm-reset-lite STATE=$(CURDIR)/tests3/.state-lite & ;; \
+			compose) $(MAKE) --no-print-directory -C tests3 vm-reset-compose STATE=$(CURDIR)/tests3/.state-compose & ;; \
+			helm)    bash $(CURDIR)/tests3/lib/reset/reset-helm.sh STATE=$(CURDIR)/tests3/.state-helm & ;; \
+		esac; \
+	done; wait
+
+release-full:                      ## stage 06 authoritative variant — fresh-reset + full matrix + gate
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@$(MAKE) --no-print-directory release-reset SCOPE=$(SCOPE)
+	@MODES="$(_SCOPE_MODES)"; \
+	for mode in $$MODES; do \
+		case $$mode in \
+			lite)    $(MAKE) --no-print-directory -C tests3 vm-smoke-lite STATE=$(CURDIR)/tests3/.state-lite & ;; \
+			compose) $(MAKE) --no-print-directory -C tests3 vm-smoke-compose STATE=$(CURDIR)/tests3/.state-compose & ;; \
+			helm)    $(MAKE) --no-print-directory -C tests3 lke-smoke STATE=$(CURDIR)/tests3/.state-helm SCOPE= & ;; \
+		esac; \
+	done; wait
+	@$(MAKE) --no-print-directory release-report
+
+release-issue-add:                 ## add an issue to scope.yaml (enforces gap_analysis + new_checks when SOURCE=human)
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE=tests3/releases/<id>/scope.yaml" && exit 2)
+	@test -n "$(ID)" || (echo "  ERROR: set ID=<bug-slug>" && exit 2)
+	@test -n "$(SOURCE)" || (echo "  ERROR: set SOURCE=human|gh-issue|internal|regression" && exit 2)
+	@test -n "$(PROBLEM)" || (echo "  ERROR: set PROBLEM='...'" && exit 2)
+	@python3 $(CURDIR)/tests3/lib/release-issue-add.py \
+	  --scope $(SCOPE) --id "$(ID)" --source "$(SOURCE)" --problem "$(PROBLEM)" \
+	  $(if $(REF),--ref "$(REF)") \
+	  $(if $(HYPOTHESIS),--hypothesis "$(HYPOTHESIS)") \
+	  $(if $(GAP),--gap "$(GAP)") \
+	  $(if $(NEW_CHECKS),--new-checks "$(NEW_CHECKS)") \
+	  $(if $(MODES),--modes "$(MODES)") \
+	  $(if $(HV_MODE),--human-verify-mode "$(HV_MODE)") \
+	  $(if $(HV_DO),--human-verify-do "$(HV_DO)") \
+	  $(if $(HV_EXPECT),--human-verify-expect "$(HV_EXPECT)")
+
+release-human-sheet:               ## stage 08 sub: generate tests3/releases/<id>/human-checklist.md
+	@$(_STAGE) assert-is human
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@python3 $(CURDIR)/tests3/lib/human-checklist.py generate --scope $(SCOPE)
+
+release-human-gate:                ## stage 08 sub: verify every `- [ ]` is `- [x]`
+	@$(_STAGE) assert-is human
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@python3 $(CURDIR)/tests3/lib/human-checklist.py gate --scope $(SCOPE)
+
+release-human:                     ## stage 08: generate sheet → human ticks → gate (convenience wrapper)
+	@$(MAKE) --no-print-directory release-human-sheet SCOPE=$(SCOPE)
+	@echo "  → human: edit tests3/releases/*/human-checklist.md, then re-invoke to gate"
+	@$(MAKE) --no-print-directory release-human-gate SCOPE=$(SCOPE)
+
+release-teardown:                  ## stage 10: destroy all provisioned infra (after release-ship)
+	@$(_STAGE) assert-is ship
+	@MODES="lite compose helm"; \
+	if [ -n "$(SCOPE)" ] && [ -f "$(SCOPE)" ]; then MODES="$(_SCOPE_MODES)"; fi; \
+	for mode in $$MODES; do \
+		case $$mode in \
+			lite)    $(MAKE) --no-print-directory -C tests3 vm-destroy STATE=$(CURDIR)/tests3/.state-lite 2>/dev/null || true ;; \
+			compose) $(MAKE) --no-print-directory -C tests3 vm-destroy STATE=$(CURDIR)/tests3/.state-compose 2>/dev/null || true ;; \
+			helm)    $(MAKE) --no-print-directory -C tests3 lke-destroy STATE=$(CURDIR)/tests3/.state-helm 2>/dev/null || true ;; \
+		esac; \
+	done
+	@$(_STAGE) enter teardown --actor make:release-teardown
+	@$(_STAGE) enter idle --actor make:release-teardown --reason "cycle closed"
+
+# ── Compatibility aliases (old names) ──
+release-helm-upgrade-safe:         ## v0.10.5.3 Pack H: pre-flight image-exists check + atomic helm upgrade
+	@# Captures the outage shape from the v0.10.5.2 ship cycle:
+	@# - silent build failures pushed non-existent image tags into helm values
+	@# - non-atomic helm upgrade applied them anyway, killed old pods
+	@# - replicaCount: 1 + maxUnavailable: 1 left zero pods serving = 502
+	@# This target prevents the chain by failing FAST if any image referenced
+	@# by the rendered helm values doesn't actually exist on the registry,
+	@# then calling: helm upgrade ... --atomic --wait --timeout 5m so a
+	@# bad-pod scenario auto-rolls back instead of staying broken.
+	@# Required env: RELEASE_NAME, NAMESPACE, KUBECONFIG, KUBE_CONTEXT, CHART_PATH, VALUES_FILES (space-separated)
+	@test -n "$(RELEASE_NAME)" || (echo "  ERROR: RELEASE_NAME required" && exit 2)
+	@test -n "$(NAMESPACE)" || (echo "  ERROR: NAMESPACE required" && exit 2)
+	@test -n "$(CHART_PATH)" || (echo "  ERROR: CHART_PATH required" && exit 2)
+	@test -n "$(VALUES_FILES)" || (echo "  ERROR: VALUES_FILES required (space-separated -f files)" && exit 2)
+	@VALUES_ARGS=""; for f in $(VALUES_FILES); do VALUES_ARGS="$$VALUES_ARGS -f $$f"; done; \
+	echo "  [pre-flight] rendering chart values..."; \
+	RENDERED=$$(helm template $(RELEASE_NAME) $(CHART_PATH) $$VALUES_ARGS 2>/dev/null); \
+	if [ -z "$$RENDERED" ]; then echo "  ERROR: helm template returned empty" && exit 1; fi; \
+	IMAGES=$$(echo "$$RENDERED" | grep -oE 'image:\s+[^\s\"]+' | awk '{print $$2}' | sed 's/^"//;s/"$$//' | sort -u | grep -v '^$$' | grep -v '\$$'); \
+	if [ -z "$$IMAGES" ]; then echo "  WARN: no images found in rendered template (check chart)"; fi; \
+	echo "  [pre-flight] verifying $$(echo "$$IMAGES" | wc -l) images exist on registry..."; \
+	MISSING=""; \
+	for img in $$IMAGES; do \
+		if docker manifest inspect "$$img" >/dev/null 2>&1; then \
+			echo "    OK   $$img"; \
 		else \
-			docker build --platform linux/amd64 -t $(BOT_IMAGE_NAME) -f services/vexa-bot/Dockerfile ./services/vexa-bot; \
+			echo "    MISS $$img"; \
+			MISSING="$$MISSING $$img"; \
 		fi; \
-	else \
-		docker build --platform linux/amd64 -t $(BOT_IMAGE_NAME) -f services/vexa-bot/Dockerfile ./services/vexa-bot; \
-	fi
-
-# Build transcription-service based on TRANSCRIPTION
-build-transcription-service: check_docker
-	@if [ "$(TRANSCRIPTION)" = "remote" ]; then \
-		exit 0; \
-	elif [ "$(TRANSCRIPTION)" = "cpu" ]; then \
-		cd services/transcription-service && docker compose -f docker-compose.cpu.yml build; \
-	elif [ "$(TRANSCRIPTION)" = "gpu" ]; then \
-		cd services/transcription-service && docker compose build; \
-	fi
-
-# Build Docker Compose service images
-build: check_docker build-bot-image build-transcription-service
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	docker compose $$COMPOSE_FILES --profile remote build
-
-# Start transcription-service based on TRANSCRIPTION
-up-transcription-service: check_docker
-	@if [ "$(TRANSCRIPTION)" = "remote" ]; then \
-		exit 0; \
-	elif [ "$(TRANSCRIPTION)" = "cpu" ]; then \
-		cd services/transcription-service && docker compose -f docker-compose.cpu.yml up -d; \
-	elif [ "$(TRANSCRIPTION)" = "gpu" ]; then \
-		cd services/transcription-service && docker compose up -d; \
-	fi
-
-# Stop transcription-service
-down-transcription-service: check_docker
-	@cd services/transcription-service && docker compose -f docker-compose.cpu.yml down 2>/dev/null || true
-	@cd services/transcription-service && docker compose down 2>/dev/null || true
-
-# Start services in detached mode
-up: check_docker
-	@if [ "$(TRANSCRIPTION)" != "remote" ]; then \
-		$(MAKE) up-transcription-service; \
-	fi
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	if ! docker network ls | grep -q "vexa-network"; then \
-		echo "Creating vexa-network..."; \
-		docker network create vexa-network || true; \
-	fi; \
-	docker compose $$COMPOSE_FILES --profile remote up -d; \
-	sleep 3; \
-	if [ "$$REMOTE_DB" = "true" ]; then \
-		if docker compose $$COMPOSE_FILES ps -q postgres 2>/dev/null | grep -q .; then \
-			echo "WARNING: postgres container is running but REMOTE_DB=true"; \
-			exit 1; \
-		fi; \
-	else \
-		if ! docker compose $$COMPOSE_FILES ps -q postgres 2>/dev/null | grep -q .; then \
-			echo "ERROR: postgres container failed to start. Check logs with: docker compose $$COMPOSE_FILES logs postgres"; \
-			exit 1; \
-		fi; \
-		echo "✓ Local postgres container is running"; \
-	fi
-
-# Stop services
-down: check_docker down-transcription-service
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	docker compose $$COMPOSE_FILES down
-
-# Show container status
-ps: check_docker
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	docker compose $$COMPOSE_FILES ps
-
-# Tail logs for all services
-logs:
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	docker compose $$COMPOSE_FILES logs -f
-
-# Run the interaction test script
-test: check_docker
-	@if [ -f .env ]; then \
-		API_PORT=$$(grep -E '^[[:space:]]*API_GATEWAY_HOST_PORT=' .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "8056"); \
-		ADMIN_PORT=$$(grep -E '^[[:space:]]*ADMIN_API_HOST_PORT=' .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "8057"); \
-		echo "API: http://localhost:$$API_PORT/docs"; \
-		echo "Admin: http://localhost:$$ADMIN_PORT/docs"; \
-	else \
-		echo "API: http://localhost:8056/docs"; \
-		echo "Admin: http://localhost:8057/docs"; \
-	fi
-	@chmod +x testing/run_vexa_interaction.sh
-	@if [ -f .env ]; then \
-		DEVICE_TYPE=$$(grep -E '^[[:space:]]*DEVICE_TYPE=' .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//'); \
-		WHISPER_MODEL=$$(grep -E '^[[:space:]]*WHISPER_MODEL_SIZE=' .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//'); \
-		if [ "$$DEVICE_TYPE" = "cpu" ] || [ "$$DEVICE_TYPE" = "" ]; then \
-			echo "⚠️  WARNING: CPU mode - DEVELOPMENT ONLY"; \
-		fi; \
-	fi
-	@if [ -n "$(MEETING_ID)" ]; then \
-		./testing/run_vexa_interaction.sh "$(MEETING_ID)"; \
-	else \
-		./testing/run_vexa_interaction.sh; \
-	fi
-
-# Quick API connectivity test
-test-api: check_docker
-	@API_PORT=$$(grep -E '^[[:space:]]*API_GATEWAY_HOST_PORT=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "8056"); \
-	ADMIN_PORT=$$(grep -E '^[[:space:]]*ADMIN_API_HOST_PORT=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "8057"); \
-	if ! curl -s -f "http://localhost:$$API_PORT/docs" > /dev/null; then \
-		echo "❌ API Gateway not responding"; \
+	done; \
+	if [ -n "$$MISSING" ]; then \
+		echo ""; \
+		echo "  ABORT: $$(echo $$MISSING | wc -w) image(s) missing on registry — refusing helm upgrade:"; \
+		for img in $$MISSING; do echo "    - $$img"; done; \
 		exit 1; \
 	fi; \
-	if ! curl -s -f "http://localhost:$$ADMIN_PORT/docs" > /dev/null; then \
-		echo "❌ Admin API not responding"; \
-		exit 1; \
-	fi; \
-	echo "✅ API connectivity test passed"
+	echo "  [pre-flight] all images present"; \
+	echo "  [helm-upgrade] $(RELEASE_NAME) → $(NAMESPACE) (atomic, wait, timeout 5m)..."; \
+	helm upgrade $(RELEASE_NAME) $(CHART_PATH) \
+		$(if $(KUBECONFIG),--kubeconfig=$(KUBECONFIG),) \
+		$(if $(KUBE_CONTEXT),--kube-context=$(KUBE_CONTEXT),) \
+		-n $(NAMESPACE) $$VALUES_ARGS \
+		--reuse-values=false --atomic --wait --timeout 5m
 
-# Test system setup without requiring meeting ID
-test-setup: check_docker
-	@if [ -f .env ]; then \
-		API_PORT=$$(grep -E '^[[:space:]]*API_GATEWAY_HOST_PORT=' .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "8056"); \
-		ADMIN_PORT=$$(grep -E '^[[:space:]]*ADMIN_API_HOST_PORT=' .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "8057"); \
-		echo "API: http://localhost:$$API_PORT/docs"; \
-		echo "Admin: http://localhost:$$ADMIN_PORT/docs"; \
-	fi
-	@$(MAKE) test-api
-	@echo "Ready for testing. Use 'make test MEETING_ID=your-meeting-id'"
+release-test: release-provision release-deploy release-full  ## alias: full pipeline up through the gate (requires SCOPE)
+release-test-no-helm:              ## alias: old 2-VM pipeline (creates a transient scope for compatibility)
+	@echo "  release-test-no-helm is deprecated; use release-plan + release-provision + release-full with SCOPE." && exit 2
 
-# --- Database Migration Commands ---
-
-# Smart migration: detects if database is fresh, legacy, or already Alembic-managed
-migrate-or-init: check_docker
-	@set -e; \
-	REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	DB_HOST=$$(grep -E '^[[:space:]]*DB_HOST=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "postgres"); \
-	DB_PORT=$$(grep -E '^[[:space:]]*DB_PORT=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "5432"); \
-	DB_NAME=$$(grep -E '^[[:space:]]*DB_NAME=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "vexa"); \
-	DB_USER=$$(grep -E '^[[:space:]]*DB_USER=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "postgres"); \
-	[ -n "$$DB_NAME" ] || DB_NAME="vexa"; \
-	[ -n "$$DB_USER" ] || DB_USER="postgres"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		if ! docker compose $$COMPOSE_FILES ps -q postgres | grep -q .; then \
-			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
-			exit 1; \
-		fi; \
-		count=0; \
-		while ! docker compose $$COMPOSE_FILES exec -T postgres pg_isready -U $$DB_USER -d $$DB_NAME -q; do \
-			if [ $$count -ge 12 ]; then \
-				echo "ERROR: Database did not become ready in 60 seconds."; \
-				exit 1; \
-			fi; \
-			sleep 5; \
-			count=$$((count+1)); \
+release-report:                    ## aggregate .state-{lite,compose,helm}/reports/* → tests3/reports/release-<tag>.md
+	@mkdir -p tests3/.state/reports
+	@# VM modes (lite + compose): reports land at tests3/.state-<mode>/reports/<mode>/ (pulled via vm-run.sh).
+	@# helm mode: validate-helm runs locally against STATE=tests3/.state-helm, so reports land at
+	@# tests3/.state-helm/reports/helm/ OR tests3/.state/reports/helm/ depending on STATE propagation.
+	@for mode in lite compose helm; do \
+		mkdir -p tests3/.state/reports/$$mode; \
+		for src in tests3/.state-$$mode/reports/$$mode tests3/.state/reports/$$mode; do \
+			[ -d "$$src" ] && find "$$src" -maxdepth 1 -name "*.json" -exec cp {} tests3/.state/reports/$$mode/ \; 2>/dev/null || true; \
 		done; \
-		docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
-		HAS_ALEMBIC_TABLE=$$(docker compose $$COMPOSE_FILES exec -T postgres psql -U $$DB_USER -d $$DB_NAME -t -c "SELECT 1 FROM information_schema.tables WHERE table_name = 'alembic_version';" 2>/dev/null | tr -d '[:space:]' || echo ""); \
-		if [ "$$HAS_ALEMBIC_TABLE" = "1" ]; then \
-			$(MAKE) migrate; \
-		else \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --create-if-missing; \
+	done
+	@for mode in lite compose helm; do \
+		if [ -f "tests3/.state-$$mode/image_tag" ]; then \
+			cp tests3/.state-$$mode/image_tag tests3/.state/image_tag; \
+			break; \
 		fi; \
+	done
+	@TAG=$$(cat tests3/.state/image_tag 2>/dev/null || echo "unknown"); \
+	SCOPE_ARG=""; \
+	if [ -n "$(SCOPE)" ] && [ -f "$(SCOPE)" ]; then SCOPE_ARG="--scope $(SCOPE)"; fi; \
+	python3 tests3/lib/aggregate.py --write-features \
+		--out tests3/reports/release-$$TAG.md \
+		$$SCOPE_ARG --gate-check && \
+		echo "" && echo "  Release gate PASSED. Report → tests3/reports/release-$$TAG.md" || \
+		(echo "" && echo "  Release gate FAILED — see tests3/reports/release-$$TAG.md" && exit 1)
+
+release-gh-status:                 ## internal: push `release/vm-validated` GitHub commit status
+	@SHA=$$(git rev-parse HEAD); \
+	gh api repos/Vexa-ai/vexa/statuses/$$SHA \
+		-f state=success \
+		-f context=release/vm-validated \
+		-f description="VM+helm tests passed + report gate on $$(date +%Y-%m-%d)" && \
+	echo "  ✓ Commit status pushed: release/vm-validated on $$SHA"
+
+release-ship:                      ## stage 09: PR dev→main, promote :dev → :latest
+	@$(_STAGE) assert-is human
+	@test -n "$(SCOPE)" || (echo "  ERROR: set SCOPE" && exit 2)
+	@echo "  ── 1. human gate (re-verify) ──"
+	@$(MAKE) --no-print-directory release-human-gate SCOPE=$(SCOPE)
+	@echo "  ── 2. push GitHub validation status ──"
+	@$(MAKE) --no-print-directory release-gh-status
+	@echo ""
+	@echo "  ── Step 2: Create + merge PR ──"
+	@TAG=$$(cat deploy/compose/.last-tag); \
+	EXISTING=$$(gh pr list --head dev --base main --json number --jq '.[0].number' 2>/dev/null); \
+	if [ -n "$$EXISTING" ]; then \
+		echo "  PR #$$EXISTING already exists, merging..."; \
+		gh pr merge $$EXISTING --merge; \
 	else \
-		docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
-		DB_STATE=$$(docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/check_db_state.py 2>/dev/null || echo "fresh"); \
-		if [ "$$DB_STATE" = "alembic" ]; then \
-			$(MAKE) migrate; \
+		gh pr create --base main --head dev \
+			--title "Release $$TAG" \
+			--body "Validated release $$TAG" && \
+		EXISTING=$$(gh pr list --head dev --base main --json number --jq '.[0].number'); \
+		gh pr merge $$EXISTING --merge; \
+	fi
+	@echo ""
+	@echo "  ── Step 3: Fix env-example on main ──"
+	@git checkout main && git pull && \
+	sed -i 's|^IMAGE_TAG=dev|IMAGE_TAG=latest|' deploy/env-example && \
+	sed -i 's|^BROWSER_IMAGE=vexaai/vexa-bot:dev|BROWSER_IMAGE=vexaai/vexa-bot:latest|' deploy/env-example && \
+	git add deploy/env-example && \
+	git commit -m "fix: restore IMAGE_TAG=latest on main after dev merge" && \
+	git push origin main
+	@echo ""
+	@echo "  ── Step 4: Promote :latest ──"
+	@$(MAKE) --no-print-directory -C deploy/compose promote-latest
+	@echo ""
+	@echo "  ── Step 5: Publish packages to npm ──"
+	@$(MAKE) --no-print-directory release-publish-packages
+	@echo ""
+	@echo "  ── Step 6: Switch back to dev ──"
+	@git checkout dev && git merge main --no-edit
+	@TAG=$$(cat deploy/compose/.last-tag); \
+	echo ""; \
+	echo "  ══════════════════════════════════════════"; \
+	echo "  Release $$TAG shipped."; \
+	echo "  :latest = :dev = $$TAG (same SHA)"; \
+	echo "  Now on dev branch. Ready for next cycle."; \
+	echo "  ══════════════════════════════════════════"
+	@$(_STAGE) enter ship --actor make:release-ship
+
+release-promote:                   ## promote :dev → :latest on DockerHub (standalone)
+	@$(MAKE) --no-print-directory -C deploy/compose promote-latest
+
+release-publish-packages:          ## build + publish every packages/* to npm (idempotent)
+	@for dir in packages/*/; do \
+		[ -f "$$dir/package.json" ] || continue; \
+		NAME=$$(python3 -c "import json; print(json.load(open('$$dir/package.json'))['name'])"); \
+		VERSION=$$(python3 -c "import json; print(json.load(open('$$dir/package.json'))['version'])"); \
+		echo ""; \
+		echo "  ── publishing $$NAME@$$VERSION ──"; \
+		LIVE=$$(npm view "$$NAME@$$VERSION" version 2>/dev/null || echo ""); \
+		if [ "$$LIVE" = "$$VERSION" ]; then \
+			echo "  ✓ $$NAME@$$VERSION already on npm, skipping"; \
 		else \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --create-if-missing; \
+			(cd "$$dir" && npm install --no-audit --no-fund && npm publish) || \
+				{ echo "  ✗ publish failed for $$NAME@$$VERSION"; exit 1; }; \
+			echo "  ✓ $$NAME@$$VERSION published"; \
 		fi; \
-	fi
+	done
 
-# Apply all pending migrations
-migrate: check_docker
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		if ! docker compose -f docker-compose.yml -f docker-compose.local-db.yml ps postgres | grep -q "Up"; then \
-			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
-			exit 1; \
-		fi; \
-		DB_USER=$$(grep -E '^[[:space:]]*DB_USER=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "postgres"); \
-		DB_NAME=$$(grep -E '^[[:space:]]*DB_NAME=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "vexa"); \
-		[ -n "$$DB_USER" ] || DB_USER="postgres"; \
-		[ -n "$$DB_NAME" ] || DB_NAME="vexa"; \
-		docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
-		current_version=$$(docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini current 2>/dev/null | grep -E '^[a-f0-9]{12}' | head -1 || echo ""); \
-		if [ "$$current_version" = "dc59a1c03d1f" ]; then \
-			if docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T postgres psql -U $$DB_USER -d $$DB_NAME -t -c "SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'data';" | grep -q 1; then \
-				docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini stamp 5befe308fa8b; \
-			fi; \
-		fi; \
-		docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini upgrade head; \
-	else \
-		docker compose -f docker-compose.yml exec -T transcription-collector alembic -c /app/alembic.ini upgrade head; \
-	fi
+# ═══ Util ════════════════════════════════════════════════════════
 
-# Create a new migration file
-makemigrations: check_docker
-	@if [ -z "$(M)" ]; then \
-		echo "Usage: make makemigrations M=\"your migration message\""; \
-		exit 1; \
-	fi
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-		if ! docker compose $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
-			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
-			exit 1; \
-		fi; \
-	fi
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini revision --autogenerate -m "$(M)"
-
-# Initialize the database
-init-db: check_docker
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-	fi; \
-	docker compose $$COMPOSE_FILES run --rm transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
-	docker compose $$COMPOSE_FILES run --rm transcription-collector alembic -c /app/alembic.ini stamp head
-
-# Stamp existing database with current version
-stamp-db: check_docker
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-		if ! docker compose $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
-			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
-			exit 1; \
-		fi; \
-	fi
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini stamp head
-
-# Show current migration status
-migration-status: check_docker
-	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
-	COMPOSE_FILES="-f docker-compose.yml"; \
-	if [ "$$REMOTE_DB" != "true" ]; then \
-		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-		if ! docker compose $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
-			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
-			exit 1; \
-		fi; \
-	fi
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini current
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini history --verbose
+help:                              ## show targets
+	@grep -E '^[a-z].*:.*##' $(MAKEFILE_LIST) | awk -F '##' '{printf "  %-20s %s\n", $$1, $$2}'
