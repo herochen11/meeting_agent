@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "vexa-webhook": {
+      "command": "bun",
+      "args": [
+        "./mcp/webhook-channel.ts"
+      ],
+      "env": {
+        "WEBHOOK_PORT": "8901"
+      }
+    }
+  }
+}

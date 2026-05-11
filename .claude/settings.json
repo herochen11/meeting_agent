@@ -1,0 +1,54 @@
+{
+  "enabledPlugins": {
+    "telegram@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "mcp__plugin_telegram_telegram__reply",
+      "mcp__vexa__join_meeting",
+      "mcp__vexa__get_status",
+      "mcp__vexa__get_meetings",
+      "mcp__vexa__get_transcript",
+      "mcp__vexa__summarize_meeting",
+      "mcp__vexa__create_sheet",
+      "mcp__vexa__init_sheet_headers",
+      "mcp__vexa__write_doc",
+      "mcp__vexa__append_action_items",
+      "mcp__vexa__update_action_item",
+      "mcp__vexa__get_action_items",
+      "mcp__vexa__set_cron",
+      "mcp__vexa__list_crons",
+      "mcp__vexa__delete_cron",
+      "mcp__vexa__get_config",
+      "mcp__vexa__add_department",
+      "mcp__vexa__update_member",
+      "mcp__claude_ai_Google_Drive__*",
+      "mcp__claude_ai_Google_Calendar__*",
+      "mcp__claude_ai_Google_Sheets__*"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./.claude/hooks/block-google-delete.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "vexa": {
+      "command": "python",
+      "args": [
+        "./mcp/server.py"
+      ],
+      "env": {
+        "VEXA_API_URL": "http://localhost:8056"
+      }
+    }
+  }
+}
