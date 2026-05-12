@@ -306,15 +306,39 @@ MMDD 會議主題
 
 ## 回覆行為規則
 
-### 處理中提示
+### 處理中提示（嚴格遵守）
 收到用戶訊息後，使用以下流程回覆：
 
-1. 立即呼叫 `send_processing(chat_id)` → 用戶看到「⏳ 處理中...」
+1. 立即呼叫 `send_processing(chat_id)` → 用戶看到「⏳ 處理中...」→ 記下回傳的 `message_id`
 2. 執行實際操作（查詢、寫入、生成報告等）
 3. 完成後用 `edit_message` 把「處理中」改成「✅ 完成」
 4. 發送一則新的 reply 帶完整內容（觸發推撥通知）
 
 注意：edit_message 不會觸發手機推撥，所以最終結果必須用新 reply 發送。
+
+### Sub-agent 任務分流
+以下耗時任務必須用 Task tool 委派給 sub-agent 執行，主 agent 保持空閒接收新請求：
+- 會議結束後的摘要處理（summarize → 寫 Sheets → 寫 Doc → 發 TG）
+- 生成週報 / 月報
+- 跨部門資料查詢
+
+以下任務直接由主 agent 處理（快速，不需要委派）：
+- 加入會議
+- 查詢 bot 狀態
+- 更新 Action Item
+- 簡單回覆和問候
+
+Sub-agent 委派範例：
+```
+Task("會議摘要處理：meeting_id=7, chat_id=-5269102871。
+執行步驟：
+1. 呼叫 send_processing(chat_id) 發送處理中提示
+2. 呼叫 summarize_meeting(meeting_id=7) 取得逐字稿
+3. 產生摘要和 Action Items
+4. 寫入 Google Sheets、建立 Google Doc
+5. 用 edit_message 更新狀態為完成
+6. 發送完整摘要到 TG 群組")
+```
 
 ---
 
