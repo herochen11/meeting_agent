@@ -213,14 +213,36 @@ curl -X POST "http://localhost:8057/admin/users/1/tokens?scopes=bot,tx" \
 ./vexa.sh admin-down
 ```
 
-### Step 8：連接 Google MCP（Claude.ai）
+### Step 8：註冊 MCP Server
+
+在專案目錄下執行：
+```bash
+# 註冊 Vexa MCP server
+claude mcp add vexa -s project -- python ./mcp/server.py
+
+# 註冊 Webhook Channel
+claude mcp add vexa-webhook -s project -e WEBHOOK_PORT=8901 -- bun ./mcp/webhook-channel.ts
+
+# 確認註冊成功
+claude mcp list
+```
+
+應該看到：
+- `vexa: python ./mcp/server.py` → ✅ Connected
+- `vexa-webhook: bun ./mcp/webhook-channel.ts` → ✅ Connected
+- `claude.ai Google Drive` → ✅ Connected
+- `claude.ai Google Calendar` → ✅ Connected
+
+> ⚠️ 如果 `vexa-webhook` 顯示 Failed to connect，確認：`cd mcp && bun install && cd ..`，並確認 port 8901 沒有被佔用。
+
+### Step 9：連接 Google MCP（Claude.ai）
 
 1. 打開 [claude.ai](https://claude.ai)
 2. 進入 Settings → Connected Apps
-3. 連接 Google Drive、Google Calendar、Google Sheets
+3. 連接 Google Drive、Google Calendar
 4. 使用與 Service Account 同一 Google 帳號登入
 
-### Step 9：啟動 Claude Code Agent
+### Step 10：啟動 Claude Code Agent
 
 ```bash
 ./vexa.sh agent
@@ -326,27 +348,133 @@ docker exec vexa-postgres-1 psql -U postgres -d vexa -c \
 
 ## 疑難排解
 
-**Bot 加不進會議**
-- 確認 `./vexa.sh status` 所有服務正常
-- 確認 API token 有 `bot` scope
-- 查看 log：`./vexa.sh logs meeting-api`
+### `docker-compose: command not found`
+新版 Docker 用 `docker compose`（空格），不是舊版的 `docker-compose`（連字號）。系統內的腳本已用 V2 語法，直接用 `make all-build` 或 `./vexa.sh` 即可。如果其他工具需要舊版指令：
+```bash
+echo 'alias docker-compose="docker compose"' >> ~/.bashrc && source ~/.bashrc
+```
 
-**會議結束但沒有自動產出記錄**
-- 確認 webhook channel 在跑：`cat mcp/webhook-channel.log`
-- 確認 `POST_MEETING_HOOKS` 設定正確
-- 手動測試：`curl -s -X POST http://localhost:8901/health`
+### Transcription token 過期（403）
+`make all-build` 時出現 `TRANSCRIPTION_SERVICE_TOKEN rejected (403)`。
+到 https://vexa.ai/account 取得新 token，更新 `.env` 的 `TRANSCRIPTION_SERVICE_TOKEN`，重新執行。
 
-**Google Sheets/Docs 寫入失敗**
-- 確認 `credentials/google-service-account.json` 存在且有效
-- 確認 Service Account 有被分享到目標 Sheet/Doc
-- 確認 Google Sheets API、Docs API、Drive API 都已啟用
+### Port 衝突
+常用 port 清單：8056、8057、5458、6379、9000、9001、8901。檢查衝突：
+```bash
+for port in 8056 8057 5458 6379 9000 9001 8901; do
+  ss -tlnp | grep -q ":$port " && echo "⚠️  Port $port 已佔用" || echo "✅ Port $port 可用"
+done
+```
+大部分 port 可在 `.env` 中修改。
 
-**逐字稿出現整句英文**
-- 這是 Whisper 對中英混雜的已知行為
-- 系統會在寫入 Google Doc 時自動翻譯為中文
-- 如問題嚴重，可考慮在 Vexa 轉錄設定中指定 language=zh
+### Vexa API 回傳 401
+通常是 `.env` 裡有兩個 token 互相衝突。`server.py` 優先讀 `VEXA_API_KEY`，其次才讀 `VEXA_USER_API_KEY`。
+```bash
+# 檢查有哪些 token
+grep VEXA .env
 
-**Claude Code session compaction 後遺失上下文**
-- 設計上已緩解：所有動態資料在 `config/departments.json`
-- 每次操作前 Claude 會自動用 `get_config` 查詢
-- 不需要手動介入
+# 驗證 token 是否有效
+curl -s "http://localhost:8056/bots/status" \
+  -H "X-API-Key: <你的token>"
+
+# 如果 VEXA_API_KEY 是 make 自動產生的且無效，刪掉它
+sed -i '/^VEXA_API_KEY=/d' .env
+```
+如果兩個都無效，重新建 token：
+```bash
+./vexa.sh admin-up
+curl -s -X POST "http://localhost:8057/admin/users/1/tokens?scopes=bot,tx" \
+  -H "X-Admin-API-Key: $(grep ADMIN_TOKEN .env | cut -d= -f2)" | python3 -m json.tool
+# 把回傳的 token 填入 .env 的 VEXA_USER_API_KEY
+./vexa.sh admin-down
+```
+
+### Bot container 啟動失敗（404 image not found）
+`runtime-api` 報 `404 Client Error: Not Found` 表示 BROWSER_IMAGE tag 跟實際 build 出來的不一致。
+```bash
+# 查實際有哪些 image
+docker images | grep vexa-bot
+
+# 查 .env 指向哪個 tag
+grep BROWSER_IMAGE .env
+grep IMAGE_TAG .env
+
+# 把 .env 更新成實際的 tag
+sed -i 's/舊的tag/新的tag/g' .env
+
+# 重要：修改 .env 後必須 down + up，不能只 restart
+./vexa.sh down
+./vexa.sh up
+
+# 確認 runtime-api 讀到新的 image
+docker exec vexa-runtime-api-1 env | grep BROWSER
+```
+
+### MCP `vexa` 沒出現在 `claude mcp list`
+Python 依賴沒裝好。先手動測試：
+```bash
+python ./mcp/server.py
+# 應該卡住等 stdin（正常），Ctrl+C 結束
+# 如果報錯，補裝依賴：
+pip install httpx gspread google-api-python-client google-auth mcp --break-system-packages
+```
+裝完後重新註冊：
+```bash
+claude mcp add vexa -s project -- python ./mcp/server.py
+```
+
+### MCP `vexa-webhook` Failed to connect
+常見原因：port 8901 被舊 process 佔住。
+```bash
+# 查誰佔了 8901
+ss -tlnp | grep 8901
+
+# 如果是舊的 bun process，kill 它
+ps -p <pid> -o pid,ppid,cmd    # 先確認是什麼
+kill <pid>
+```
+如果是依賴沒裝：
+```bash
+cd mcp && bun install && cd ..
+```
+不需要手動 `claude mcp add vexa-webhook`，它已在 `.mcp.json` 中，`./vexa.sh agent` 啟動時會自動載入。
+
+### MCP 路徑顯示絕對路徑（`/home/xxx/...`）
+之前手動 `claude mcp add` 過導致全域設定覆蓋專案設定。清除後重新註冊：
+```bash
+claude mcp remove vexa --scope user
+claude mcp add vexa -s project -- python ./mcp/server.py
+```
+
+### Google Service Account 憑證缺失
+確認金鑰檔存在：
+```bash
+ls -la credentials/google-service-account.json
+```
+如果不存在，從 Google Cloud Console 下載並放到 `credentials/` 目錄。
+
+### 修改 `.env` 後服務沒變化
+
+Docker 服務不會自動重讀 `.env`，必須完整重啟：
+```bash
+./vexa.sh down
+./vexa.sh up
+```
+MCP server 同理，修改 `.env` 後要重新註冊：
+```bash
+claude mcp remove vexa -s project
+claude mcp add vexa -s project -- python ./mcp/server.py
+```
+
+### Webhook 收不到會議結束通知（Linux）
+Linux Docker Engine 不會自動解析 `host.docker.internal`（Docker Desktop for Windows/Mac 會）。
+docker-compose.yml 已加上 `extra_hosts: - "host.docker.internal:host-gateway"`。
+如果更新後仍然失敗，確認：
+```bash
+# 從 container 內測試連線
+docker exec vexa-meeting-api-1 curl -s http://host.docker.internal:8901/health
+
+# 如果仍失敗，改用實際 IP
+ip route show default | awk '{print $3}'  # 取得 gateway IP
+# 把 .env 的 POST_MEETING_HOOKS 改成 http://<gateway-ip>:8901/hooks/meeting-completed
+```
