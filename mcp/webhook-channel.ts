@@ -131,7 +131,7 @@ Bun.serve({
           ``,
           `會議 (DB ID: ${meetingId}) 已結束。`,
           ``,
-          `⚠️ 請用 Task tool 委派給 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
+          `⚠️ 請用 Agent tool 生成 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
           ``,
           `Sub-agent 執行步驟：`,
           `1. 呼叫 send_processing(chat_id) 發送處理中提示`,

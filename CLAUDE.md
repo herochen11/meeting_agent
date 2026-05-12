@@ -317,7 +317,7 @@ MMDD 會議主題
 注意：edit_message 不會觸發手機推撥，所以最終結果必須用新 reply 發送。
 
 ### Sub-agent 任務分流
-以下耗時任務必須用 Task tool 委派給 sub-agent 執行，主 agent 保持空閒接收新請求：
+以下耗時任務必須用 Agent tool 生成 sub-agent 執行，主 agent 保持空閒接收新請求：
 - 會議結束後的摘要處理（summarize → 寫 Sheets → 寫 Doc → 發 TG）
 - 生成週報 / 月報
 - 跨部門資料查詢
@@ -330,14 +330,14 @@ MMDD 會議主題
 
 Sub-agent 委派範例：
 ```
-Task("會議摘要處理：meeting_id=7, chat_id=-5269102871。
+請生成 sub-agent 處理此會議摘要：meeting_id=7, chat_id=-5269102871。
 執行步驟：
 1. 呼叫 send_processing(chat_id) 發送處理中提示
 2. 呼叫 summarize_meeting(meeting_id=7) 取得逐字稿
 3. 產生摘要和 Action Items
 4. 寫入 Google Sheets、建立 Google Doc
 5. 用 edit_message 更新狀態為完成
-6. 發送完整摘要到 TG 群組")
+6. 發送完整摘要到 TG 群組
 ```
 
 ---
