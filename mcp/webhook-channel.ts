@@ -106,12 +106,13 @@ Bun.serve({
         const payload = JSON.parse(body);
         const meeting = payload.data?.meeting || payload.meeting || {};
         const meetingId = meeting.id;
+        const nativeMeetingId = meeting.native_meeting_id || "";
         const platform = meeting.platform || "google_meet";
         const startTime = meeting.start_time || "";
         const endTime = meeting.end_time || "";
         const eventType = payload.event_type || "meeting.completed";
 
-        log(`Webhook received: meeting_id=${meetingId} platform=${platform} event=${eventType}`);
+        log(`Webhook received: meeting_id=${meetingId} native_meeting_id=${nativeMeetingId} platform=${platform} event=${eventType}`);
 
         // 去重檢查
         const dedupeKey = String(meetingId);
@@ -129,13 +130,14 @@ Bun.serve({
         const content = [
           `🔔 會議結束通知`,
           ``,
-          `會議 (DB ID: ${meetingId}) 已結束。`,
+          `會議 (DB ID: ${meetingId}, Meet ID: ${nativeMeetingId}) 已結束。`,
           ``,
           `⚠️ 請用 Agent tool 生成 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
           ``,
           `Sub-agent 執行步驟：`,
           `1. 呼叫 send_processing(chat_id) 發送處理中提示`,
           `2. 呼叫 summarize_meeting(meeting_id=${meetingId}) 取得逐字稿`,
+          `   - native_meeting_id: ${nativeMeetingId}`,
           `3. 產生摘要和 Action Items`,
           `4. 把 Action Items 寫入 Google Sheets`,
           `5. 在 Google Drive 建立會議記錄（含摘要 + Action Items + 完整逐字稿）`,
@@ -150,6 +152,7 @@ Bun.serve({
             meta: {
               event: eventType,
               meeting_id: String(meetingId),
+              native_meeting_id: nativeMeetingId,
               platform: platform,
               start_time: startTime,
               end_time: endTime,
