@@ -18,6 +18,9 @@ cd "$SCRIPT_DIR"
 # 使用新版官方 compose
 COMPOSE="docker compose -f deploy/compose/docker-compose.yml --env-file .env"
 
+# speaches（本地 Whisper 服務）獨立 compose
+SPEACHES_COMPOSE="docker compose -f docker-compose.speaches.yml"
+
 # 我們需要的服務
 SERVICES=(
   api-gateway
@@ -50,24 +53,33 @@ case "$1" in
   up)
     log "啟動所有服務..."
     $COMPOSE up -d "${SERVICES[@]}"
+    log "啟動 speaches（本地 Whisper）..."
+    $SPEACHES_COMPOSE up -d
     log "完成！使用 ./vexa.sh status 確認狀態"
     ;;
 
   down)
     log "關閉所有服務..."
     $COMPOSE down
+    log "關閉 speaches..."
+    $SPEACHES_COMPOSE down
     log "完成"
     ;;
 
   restart)
     log "重啟所有服務..."
     $COMPOSE down
+    $SPEACHES_COMPOSE down
     $COMPOSE up -d "${SERVICES[@]}"
+    $SPEACHES_COMPOSE up -d
     log "完成"
     ;;
 
   status)
     $COMPOSE ps
+    echo ""
+    log "speaches:"
+    $SPEACHES_COMPOSE ps
     ;;
 
   logs)

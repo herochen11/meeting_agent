@@ -316,19 +316,46 @@ MMDD 會議主題
 
 注意：edit_message 不會觸發手機推撥，所以最終結果必須用新 reply 發送。
 
-### Sub-agent 任務分流
-以下耗時任務必須用 Agent tool 生成 sub-agent 執行，主 agent 保持空閒接收新請求：
+### Sub-agent 任務分流（核心原則）
+
+**主 agent 永遠保持空閒能即時回覆。任何預期超過 30 秒的任務一律 spawn sub-agent。**
+
+不可以讓主 agent 自己跑長任務，否則期間進來的 TG 訊息會被卡住，使用者會以為 bot 掛掉。
+
+#### 必須委派給 sub-agent 的任務
+
+任何預期 >30 秒、可獨立完成、不需要即時往返討論的任務：
+
 - 會議結束後的摘要處理（summarize → 寫 Sheets → 寫 Doc → 發 TG）
 - 生成週報 / 月報
-- 跨部門資料查詢
+- 跨部門大量資料查詢
+- 長音檔轉錄 / 大量檔案處理
+- bug 排查 + 報告生成（含跑 curl / docker / db query 一系列分析）
+- 任何批次處理
 
-以下任務直接由主 agent 處理（快速，不需要委派）：
+#### 主 agent 直接處理的任務（快速、必須秒回）
+
+只處理 30 秒以內可完成的請求：
+
 - 加入會議
-- 查詢 bot 狀態
-- 更新 Action Item
-- 簡單回覆和問候
+- 查詢 bot / 任務狀態
+- 更新單一 Action Item
+- 簡單回覆和問候（「在嗎」、「Hey」）
+- 確認排程 / 設定變更
+- 接收新指令並決定是否委派 sub-agent
 
-Sub-agent 委派範例：
+#### 配合的回覆流程
+
+1. 收到請求 → 主 agent **立刻**回覆 acknowledgment（「在 ✅」、「⏳ 已交給 sub-agent 處理，預計 X 分鐘內完成」），tag 使用者
+2. 若任務 >30 秒，觸發 sub-agent
+3. Sub-agent 完成後自己發**新 reply** 帶結果（必須觸發推撥，不要只 edit_message）
+4. 主 agent 期間維持 standby，可以接其他訊息
+
+❗ 不要先承諾「我來查一下」然後沉默 3 分鐘；要嘛立刻回結果，要嘛立刻說「交給 sub-agent，等等回」。  
+❗ 不要等任務跑完才一次回所有人 — 沉默期會破壞信任。
+
+#### Sub-agent 委派範例
+
 ```
 請生成 sub-agent 處理此會議摘要：meeting_id=7, chat_id=-5269102871。
 執行步驟：

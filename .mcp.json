@@ -8,6 +8,14 @@
       "env": {
         "WEBHOOK_PORT": "8901"
       }
+    },
+    "vexa": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "./mcp/server.py"
+      ],
+      "env": {}
     }
   }
 }
