@@ -146,6 +146,20 @@ NoirsBoxes 會議管理/
 - ❗ 不可以刪除整行、整列、或清空 Sheet
 - 寫入前確認 Sheet 存在，不存在則先建立
 
+### Action Items 彙整 / 匯出規則（Excel、TG 整理、跟催通知等）
+
+當需要把 Action Items 整理出來給使用者看（不論 Excel 下載、TG 訊息彙整、報告生成等）：
+
+1. **依「負責人」分類與排序**：以 owner 為主分組，同 owner 內按 code 或日期排序
+2. **僅包含未完成項目**（未開始 + 進行中），**排除已完成**
+3. 每組 owner 之間用視覺分隔（Excel 用 group header row 或 freeze section；TG 訊息用 emoji 或項目編號）
+
+**Why:** Brian 明確表示「都要以負責人進行分類」+「已經完成的部分就可以先不用管」。給客戶 / 部門看的彙整應該聚焦在「誰要做什麼還沒做」，已完成的留在 Dashboard 介面查就好。
+
+**例外**：
+- `get_action_items` MCP tool 本身仍回傳所有狀態（DB raw query），這是工具的責任分工
+- 彙整 / 匯出 / 跟催的呈現端要套用此規則，不是改變底層資料
+
 ---
 
 ## 會議記錄格式（Google Doc）

@@ -89,6 +89,110 @@ Claude Code Session（WSL）
 | minio | 9000 | 錄音檔物件儲存 | ✅ |
 | admin-api | 8057 | 建 user/token，按需啟動 | 按需 |
 
+## 本地服務（非 Docker）
+
+| 服務 | Port | 說明 |
+|---|---|---|
+| speaches | 8020 | 本地 Whisper（取代 Vexa Cloud 轉錄） |
+| dashboard_api | 8765 | Dashboard 後端 API（Bun + Hono） |
+| dashboard_web | 5173 | Dashboard 前端（Vite + React） |
+| webhook-channel | 8901 | 會議結束通知 + 跟催觸發 |
+
+---
+
+# Dashboard
+
+公司內部使用的網頁介面，補足 Telegram bot 的不足：
+
+- 📋 Action Items 看板（依負責人 / 狀態分組、可編輯）
+- 🎙️ 會議記錄瀏覽（含摘要、Action Items、逐字稿）
+- 🤖 Bot 控制台（即時查看狀態、派發 / 停止 bot）
+- 🔐 部門權限隔離 + 管理員後台
+
+## 啟動方式
+
+Dashboard 已整合到 `vexa.sh`：
+
+```bash
+./vexa.sh up        # 啟動 Vexa stack + speaches + dashboard
+./vexa.sh down      # 全部關閉
+./vexa.sh status    # 查看所有服務狀態（含 dashboard PID / port）
+./vexa.sh restart   # 全部重啟
+```
+
+也可以單獨管理：
+
+```bash
+./vexa.sh dashboard-up    # 只啟動 dashboard（api + web）
+./vexa.sh dashboard-down  # 只關閉 dashboard
+```
+
+## 開啟網頁
+
+啟動後在這台電腦的瀏覽器開：
+
+```
+http://localhost:5173
+```
+
+## 預設帳密
+
+| 角色 | Slug / 入口 | 預設密碼 |
+|---|---|---|
+| 生管部門 | `production` | `changeme123` |
+| 測試群 | `test` | `changeme123` |
+| 測試2群 | `test2` | `changeme123` |
+| 管理員 | （`/admin/login`） | `admin123` |
+
+> ⚠️ **務必透過 Admin 介面儘早改掉所有預設密碼。**
+
+## 內網 vs 公司網路存取
+
+預設只能本機（127.0.0.1）連線。要讓同公司其他電腦也能用：
+
+| 模式 | 適用 | 操作 |
+|---|---|---|
+| **localhost only**（預設） | 只有這台機器的瀏覽器可進 | `cd services/dashboard_api && make local`、`cd services/dashboard_web && make local` |
+| **LAN 開放** | 同公司網路所有電腦可進 | 兩邊都 `make lan`，需手動重啟 dashboard_api（Vite 自動 reload）|
+
+切到 LAN 模式後，公司其他電腦可用 `http://<這台機器的 IP>:5173` 連線。**外網仍進不來**（除非路由器有 port forwarding）。
+
+## 服務細節
+
+| 元件 | Port | Log 位置 | PID file |
+|---|---|---|---|
+| dashboard_api（Bun + Hono） | 8765 | `/tmp/dashboard_api.log` | `/tmp/dashboard_api.pid` |
+| dashboard_web（Vite + React） | 5173 | `/tmp/dashboard_web.log` | `/tmp/dashboard_web.pid` |
+
+直接讀 log：
+```bash
+tail -f /tmp/dashboard_api.log
+tail -f /tmp/dashboard_web.log
+```
+
+## 資料來源
+
+Dashboard 讀取的資料源（**DB 主、Sheet 鏡像**）：
+
+- **PostgreSQL `nb_*` 4 個 table**（Vexa 共用 DB 內）
+  - `nb_departments`、`nb_meetings`、`nb_action_items`、`nb_admin`
+- **本地 Markdown**：`records/{部門}/MMDD_{標題}_{meet-id}.md`（前端逐字稿渲染用）
+- **Google Sheet 同步**：Telegram bot 改 Action Item 時自動雙寫 DB + Sheet，保持兩邊一致
+
+## 常見問題
+
+**Q：登入後出現「請先登入」**
+A：Cookie 沒帶上。確認瀏覽器允許 cookie，或 incognito 試試。
+
+**Q：Bot 控制台顯示「Vexa 無法連線」**
+A：Vexa 服務沒起來，跑 `./vexa.sh status` 確認。
+
+**Q：改了 .env 沒生效**
+A：dashboard_api 不自動 reload，要 `./vexa.sh dashboard-down && ./vexa.sh dashboard-up`。
+
+**Q：Dashboard 跟 Telegram 改的東西不同步**
+A：應該已自動同步（DB+Sheet 雙寫）。若還是不同步，看 `/tmp/dashboard_api.log` 找錯誤訊息。
+
 ---
 
 # 部署指南

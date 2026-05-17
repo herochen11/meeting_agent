@@ -17,6 +17,8 @@ import logging
 import subprocess
 import httpx
 import gspread
+import psycopg2
+import psycopg2.extras
 from google.oauth2.service_account import Credentials as ServiceCredentials
 from googleapiclient.discovery import build
 from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
@@ -59,6 +61,13 @@ CONFIG_FILE = os.getenv("CONFIG_FILE",
                         os.path.join(_PROJECT_ROOT, "config", "departments.json"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# PostgreSQL（用 host port，因為 MCP server 跑在 host 不是 container 內）
+DB_DSN = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5458/vexa")
+
+def _db_conn():
+    """取得 PostgreSQL connection（RealDictCursor，方便用欄位名取值）"""
+    return psycopg2.connect(DB_DSN, cursor_factory=psycopg2.extras.RealDictCursor)
 
 # Google Sheets headers
 SHEET_HEADERS = ["編號", "任務描述", "負責人", "優先級", "狀態", "預計完成時間", "來源會議", "會議日期", "備註"]
@@ -725,68 +734,322 @@ def _write_doc(doc_id: str, content: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
 
 
+def _next_code(cur, dept_id: int, mmdd: str) -> str:
+    """算出某部門在某 MMDD 的下一個 code（MMDD_N）。caller 須提供 cursor。"""
+    prefix = f"{mmdd}_"
+    cur.execute(
+        "SELECT code FROM nb_action_items WHERE department_id = %s AND code LIKE %s",
+        (dept_id, prefix + "%"),
+    )
+    max_n = 0
+    for r in cur.fetchall():
+        code = r["code"]
+        # match MMDD_N where MMDD 完全相等
+        try:
+            head, _, tail = code.partition("_")
+            if head == mmdd:
+                n = int(tail)
+                if n > max_n:
+                    max_n = n
+        except (ValueError, AttributeError):
+            continue
+    return f"{mmdd}_{max_n + 1}"
+
+
+def _mmdd_from_date(date_str: str) -> str:
+    """從 YYYY-MM-DD 取出 MMDD；空值用今天（UTC+8）"""
+    if date_str and len(date_str) >= 10:
+        # YYYY-MM-DD → MMDD
+        return date_str[5:7] + date_str[8:10]
+    # fallback：今天（UTC+8）
+    import datetime as _dt
+    now = _dt.datetime.utcnow() + _dt.timedelta(hours=8)
+    return now.strftime("%m%d")
+
+
 def _append_action_items(spreadsheet_id: str, items: list) -> str:
-    """把 Action Items append 到 Sheet"""
-    gc = get_gc()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.sheet1
+    """把 Action Items 寫入 DB（主）並 append 到 Sheet（副）。
 
-    rows = []
-    for item in items:
-        rows.append([
-            item.get("id", ""),
-            item.get("task", ""),
-            item.get("owner", "待確認"),
-            item.get("priority", "中"),
-            item.get("status", "未開始"),
-            item.get("due_date", ""),
-            item.get("source_meeting", ""),
-            item.get("meeting_date", ""),
-            item.get("notes", ""),
-        ])
+    每個 item 若沒帶 id，自動產生 code（MMDD_N）。
+    若 source_meeting (meet_id) 存在於 nb_meetings，會關聯 meeting_id。
+    """
+    if not spreadsheet_id:
+        return json.dumps({"success": False, "error": "缺少 spreadsheet_id"}, ensure_ascii=False)
+    if not items:
+        return json.dumps({"success": False, "error": "items 為空"}, ensure_ascii=False)
 
-    if rows:
-        ws.append_rows(rows, value_input_option='USER_ENTERED')
+    # ── DB 主寫 ──
+    try:
+        conn = _db_conn()
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"DB 連線失敗: {e}"}, ensure_ascii=False)
 
-    return json.dumps({
+    inserted_ids = []
+    enriched_items = []  # 帶補齊後的 code，用來寫 Sheet
+    try:
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    # 查 department_id
+                    cur.execute(
+                        "SELECT id, name FROM nb_departments WHERE sheet_id = %s LIMIT 1",
+                        (spreadsheet_id,),
+                    )
+                    dept = cur.fetchone()
+                    if not dept:
+                        return json.dumps({
+                            "success": False,
+                            "error": f"找不到對應部門（sheet_id={spreadsheet_id} 未在 nb_departments 登記）"
+                        }, ensure_ascii=False)
+                    dept_id = dept["id"]
+
+                    # 預先把每 item 補 code（避免後續 INSERT 撞號）
+                    # 同一 batch 內遞增當天計數
+                    daily_counters = {}  # mmdd -> current max
+
+                    for item in items:
+                        code = (item.get("id") or "").strip()
+                        if not code:
+                            mmdd = _mmdd_from_date(item.get("meeting_date", ""))
+                            if mmdd not in daily_counters:
+                                # 第一次遇到這個 mmdd，從 DB 算出當前最大值
+                                next_c = _next_code(cur, dept_id, mmdd)
+                                # next_c = MMDD_N，把 N 拿出來
+                                n = int(next_c.split("_")[1])
+                                code = next_c
+                                daily_counters[mmdd] = n
+                            else:
+                                daily_counters[mmdd] += 1
+                                code = f"{mmdd}_{daily_counters[mmdd]}"
+
+                        # 找 meeting_id（用 meet_id + dept 限定）
+                        meeting_id = None
+                        source_meet = (item.get("source_meeting") or "").strip()
+                        if source_meet:
+                            cur.execute(
+                                """
+                                SELECT id FROM nb_meetings
+                                WHERE meet_id = %s AND department_id = %s
+                                ORDER BY id DESC LIMIT 1
+                                """,
+                                (source_meet, dept_id),
+                            )
+                            mrow = cur.fetchone()
+                            if mrow:
+                                meeting_id = mrow["id"]
+
+                        description = item.get("task", "") or ""
+                        assignee = item.get("owner") or None  # 空字串 → NULL
+                        if assignee == "":
+                            assignee = None
+                        priority = item.get("priority") or "中"
+                        status = item.get("status") or "未開始"
+                        due_date = item.get("due_date") or None
+                        if due_date == "":
+                            due_date = None
+                        notes = item.get("notes") or None
+                        if notes == "":
+                            notes = None
+
+                        cur.execute(
+                            """
+                            INSERT INTO nb_action_items
+                              (meeting_id, department_id, code, description,
+                               assignee, priority, status, due_date, notes)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (meeting_id, dept_id, code, description,
+                             assignee, priority, status, due_date, notes),
+                        )
+                        new_id = cur.fetchone()["id"]
+                        inserted_ids.append(new_id)
+
+                        # 把補齊後的 item 留給 Sheet 寫入
+                        enriched = dict(item)
+                        enriched["id"] = code
+                        enriched["priority"] = priority
+                        enriched["status"] = status
+                        enriched_items.append(enriched)
+        except Exception as e:
+            logger.error(f"DB INSERT 失敗: {e}")
+            return json.dumps({"success": False, "error": f"DB INSERT 失敗: {e}"}, ensure_ascii=False)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # ── Sheet 副寫（失敗只 warning） ──
+    sheet_appended = False
+    sheet_url = None
+    sheet_warning = None
+    try:
+        gc = get_gc()
+        sh = gc.open_by_key(spreadsheet_id)
+        ws = sh.sheet1
+        sheet_url = sh.url
+
+        rows = []
+        for item in enriched_items:
+            rows.append([
+                item.get("id", ""),
+                item.get("task", ""),
+                item.get("owner", "待確認"),
+                item.get("priority", "中"),
+                item.get("status", "未開始"),
+                item.get("due_date", ""),
+                item.get("source_meeting", ""),
+                item.get("meeting_date", ""),
+                item.get("notes", ""),
+            ])
+
+        if rows:
+            ws.append_rows(rows, value_input_option='USER_ENTERED')
+        sheet_appended = True
+    except Exception as e:
+        sheet_warning = f"Sheet append 失敗（DB 已成功）: {e}"
+        logger.warning(sheet_warning)
+
+    result = {
         "success": True,
-        "appended": len(rows),
-        "spreadsheet_url": sh.url
-    }, ensure_ascii=False)
+        "appended": len(inserted_ids),
+        "db_inserted_ids": inserted_ids,
+        "codes": [it.get("id") for it in enriched_items],
+        "sheet_appended": sheet_appended,
+        "spreadsheet_url": sheet_url,
+    }
+    if sheet_warning:
+        result["warning"] = sheet_warning
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _update_action_item(spreadsheet_id: str, item_id: str, updates: dict) -> str:
-    """根據編號找到 Action Item 並更新指定欄位"""
-    gc = get_gc()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.sheet1
+    """根據編號找到 Action Item 並更新指定欄位。
 
-    # 找到編號所在的行
-    try:
-        cell = ws.find(item_id, in_column=1)
-    except Exception:
-        return json.dumps({"success": False, "error": f"找不到編號 {item_id}"}, ensure_ascii=False)
+    流程：DB 主寫 → Sheet 副寫。
+      1. DB UPDATE 失敗 → 整個 tool 失敗
+      2. DB code 不存在 → 失敗（不寫 Sheet，避免造成不一致）
+      3. DB 成功、Sheet 失敗 → 仍視為 success，但 warning
+    """
+    if not spreadsheet_id or not item_id:
+        return json.dumps({"success": False, "error": "缺少 spreadsheet_id 或 item_id"}, ensure_ascii=False)
+    if not updates:
+        return json.dumps({"success": False, "error": "updates 為空"}, ensure_ascii=False)
 
-    row = cell.row
-    # 欄位對應：A=編號 B=任務 C=負責人 D=優先級 E=狀態 F=截止日 G=來源會議 H=會議日期 I=備註
-    col_map = {
-        "task": 2, "owner": 3, "priority": 4, "status": 5,
-        "due_date": 6, "source_meeting": 7, "meeting_date": 8, "notes": 9
+    # ── DB 主寫 ──
+    db_field_map = {
+        "task": "description",
+        "owner": "assignee",
+        "priority": "priority",
+        "status": "status",
+        "due_date": "due_date",
+        "notes": "notes",
     }
 
-    updated_fields = []
+    set_clauses = []
+    set_values = []
+    db_updated_fields = []
     for field, value in updates.items():
-        col = col_map.get(field)
-        if col:
-            ws.update_cell(row, col, value)
-            updated_fields.append(f"{field}={value}")
+        col = db_field_map.get(field)
+        if col is None:
+            continue
+        # 空字串 due_date 視為 NULL
+        if col == "due_date" and (value == "" or value is None):
+            set_clauses.append(f"{col} = NULL")
+        else:
+            set_clauses.append(f"{col} = %s")
+            set_values.append(value)
+        db_updated_fields.append(f"{field}={value}")
 
-    return json.dumps({
+    if not set_clauses:
+        return json.dumps({"success": False, "error": "updates 沒有任何可同步欄位"}, ensure_ascii=False)
+
+    set_clauses.append("updated_at = NOW()")
+
+    db_row_id = None
+    try:
+        conn = _db_conn()
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"DB 連線失敗: {e}"}, ensure_ascii=False)
+
+    try:
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    # 查 row id（透過 sheet_id 限定部門範圍，避免跨部門同名 code 撞車）
+                    cur.execute(
+                        """
+                        SELECT ai.id
+                        FROM nb_action_items ai
+                        JOIN nb_departments d ON ai.department_id = d.id
+                        WHERE d.sheet_id = %s AND ai.code = %s
+                        LIMIT 1
+                        """,
+                        (spreadsheet_id, item_id),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return json.dumps({
+                            "success": False,
+                            "error": f"找不到對應 Action Item (sheet_id={spreadsheet_id}, code={item_id})"
+                        }, ensure_ascii=False)
+                    db_row_id = row["id"]
+
+                    # 動態 UPDATE
+                    sql = f"UPDATE nb_action_items SET {', '.join(set_clauses)} WHERE id = %s"
+                    cur.execute(sql, (*set_values, db_row_id))
+        except Exception as e:
+            logger.error(f"DB UPDATE 失敗 (item_id={item_id}): {e}")
+            return json.dumps({"success": False, "error": f"DB UPDATE 失敗: {e}"}, ensure_ascii=False)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # ── Sheet 副寫（失敗只 warning） ──
+    sheet_updated = False
+    sheet_row = None
+    sheet_warning = None
+    try:
+        gc = get_gc()
+        sh = gc.open_by_key(spreadsheet_id)
+        ws = sh.sheet1
+
+        try:
+            cell = ws.find(item_id, in_column=1)
+        except Exception as find_err:
+            sheet_warning = f"Sheet 找不到編號 {item_id}: {find_err}"
+            logger.warning(sheet_warning)
+        else:
+            sheet_row = cell.row
+            # 欄位對應：A=編號 B=任務 C=負責人 D=優先級 E=狀態 F=截止日 G=來源會議 H=會議日期 I=備註
+            col_map = {
+                "task": 2, "owner": 3, "priority": 4, "status": 5,
+                "due_date": 6, "source_meeting": 7, "meeting_date": 8, "notes": 9
+            }
+            for field, value in updates.items():
+                col = col_map.get(field)
+                if col:
+                    ws.update_cell(sheet_row, col, value)
+            sheet_updated = True
+    except Exception as e:
+        sheet_warning = f"Sheet 更新失敗（DB 已成功）: {e}"
+        logger.warning(sheet_warning)
+
+    result = {
         "success": True,
         "item_id": item_id,
-        "row": row,
-        "updated": updated_fields
-    }, ensure_ascii=False)
+        "db_row_id": db_row_id,
+        "row": sheet_row,
+        "updated": db_updated_fields,
+        "db_updated": True,
+        "sheet_updated": sheet_updated,
+    }
+    if sheet_warning:
+        result["warning"] = sheet_warning
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _get_action_items(spreadsheet_id: str, status_filter: str = "", owner_filter: str = "") -> str:

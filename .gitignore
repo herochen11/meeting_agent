@@ -95,6 +95,9 @@ env/
 !deploy/env-example
 venv/
 ENV/
+
+# NoirsBoxes meeting records (local markdown snapshots — contains actual meeting content)
+records/
 env.bak/
 venv.bak/
 
