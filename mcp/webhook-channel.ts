@@ -8,15 +8,48 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { appendFileSync } from 'fs'
+import postgres from 'postgres'
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT || "8901", 10);
 const LOG_FILE = new URL("./webhook-channel.log", import.meta.url).pathname;
+
+// Vexa Postgres 連線（用來補 webhook payload 缺漏的 native_meeting_id）
+const DATABASE_URL =
+  process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5458/vexa";
+const sql = postgres(DATABASE_URL, {
+  max: 2,
+  idle_timeout: 30,
+  connect_timeout: 5,
+  onnotice: () => {},
+});
 
 function log(msg: string) {
   const ts = new Date().toISOString();
   const line = `${ts} ${msg}\n`;
   console.error(line.trim());
   try { appendFileSync(LOG_FILE, line); } catch {}
+}
+
+/** 用 meeting.id 從 Vexa DB 查 platform_specific_id（native_meeting_id） */
+async function lookupNativeMeetingId(meetingId: unknown): Promise<{ value: string; ok: boolean }> {
+  if (meetingId === undefined || meetingId === null || meetingId === "") {
+    return { value: "", ok: false };
+  }
+  try {
+    const rows = await sql<{ platform_specific_id: string | null }[]>`
+      SELECT platform_specific_id
+      FROM meetings
+      WHERE id = ${meetingId as number}
+    `;
+    const first = rows[0];
+    if (first && first.platform_specific_id) {
+      return { value: first.platform_specific_id, ok: true };
+    }
+    return { value: "", ok: false };
+  } catch (err) {
+    log(`DB lookup error for meeting ${meetingId}: ${err}`);
+    return { value: "", ok: false };
+  }
 }
 
 // 建立 MCP 伺服器並聲明為 channel
@@ -106,13 +139,23 @@ Bun.serve({
         const payload = JSON.parse(body);
         const meeting = payload.data?.meeting || payload.meeting || {};
         const meetingId = meeting.id;
-        const nativeMeetingId = meeting.native_meeting_id || "";
+        const payloadNativeMeetingId = meeting.native_meeting_id || "";
         const platform = meeting.platform || "google_meet";
         const startTime = meeting.start_time || "";
         const endTime = meeting.end_time || "";
         const eventType = payload.event_type || "meeting.completed";
 
-        log(`Webhook received: meeting_id=${meetingId} native_meeting_id=${nativeMeetingId} platform=${platform} event=${eventType}`);
+        // Vexa webhook payload 不帶 native_meeting_id，要自己用 meeting.id 查 DB
+        const dbLookup = await lookupNativeMeetingId(meetingId);
+        const nativeMeetingId = dbLookup.ok ? dbLookup.value : payloadNativeMeetingId;
+
+        log(
+          `Webhook received: meeting_id=${meetingId} ` +
+          `native_meeting_id=${nativeMeetingId} ` +
+          `db_lookup_succeeded=${dbLookup.ok} ` +
+          `payload_native_meeting_id=${payloadNativeMeetingId || "(empty)"} ` +
+          `platform=${platform} event=${eventType}`
+        );
 
         // 去重檢查
         const dedupeKey = String(meetingId);
@@ -125,6 +168,22 @@ Bun.serve({
           });
         }
         recentMeetings.set(dedupeKey, now);
+
+        // 立刻把 nb_meetings 占位 row 的 status 從「會議進行中」改為「逐字稿處理中」
+        // 讓 Dashboard 在 sub-agent 還沒跑完前能顯示更精確的狀態
+        if (nativeMeetingId) {
+          try {
+            const updated = await sql`
+              UPDATE nb_meetings
+              SET status = '逐字稿處理中'
+              WHERE meet_id = ${nativeMeetingId} AND status = '會議進行中'
+              RETURNING id
+            `;
+            log(`Status transition: meet_id=${nativeMeetingId} → 逐字稿處理中 (rows=${updated.length})`);
+          } catch (err) {
+            log(`Status transition error for ${nativeMeetingId}: ${err}`);
+          }
+        }
 
         // 按官方格式推 channel notification
         const content = [

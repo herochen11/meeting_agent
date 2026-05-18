@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 
 import ErrorBanner from '../components/ErrorBanner';
 import { login } from '../lib/auth';
@@ -12,6 +13,7 @@ const DEFAULT_DEPTS = [
 
 export default function LoginPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [slug, setSlug] = useState(DEFAULT_DEPTS[0].slug);
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -23,6 +25,8 @@ export default function LoginPage() {
     setError(null);
     try {
       await login(slug, password);
+      // 清掉前一個部門可能殘留的 React Query 快取，確保看到新部門資料
+      queryClient.clear();
       navigate('/', { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : '登入失敗');

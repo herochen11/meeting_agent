@@ -11,8 +11,12 @@ meetingsRoute.use("/api/meetings/*", requireDept);
 
 meetingsRoute.get("/api/meetings", async (c) => {
   const deptId = getDeptId(c);
+  // 用 AT TIME ZONE 'UTC' 把 naive timestamp 明確標成 UTC，避免被 postgres.js
+  // 當成本機時間（Vexa 寫入的時間實際上是 UTC）
   const rows = await sql<Meeting[]>`
-    SELECT id, title, meet_id, status, start_time, end_time,
+    SELECT id, title, meet_id, status,
+           (start_time AT TIME ZONE 'UTC') AS start_time,
+           (end_time AT TIME ZONE 'UTC') AS end_time,
            duration_minutes, summary
     FROM nb_meetings
     WHERE department_id = ${deptId}
@@ -30,8 +34,12 @@ meetingsRoute.get("/api/meetings/:id", async (c) => {
 
   const meetings = await sql<Meeting[]>`
     SELECT id, department_id, vexa_meeting_id, title, meet_id, platform,
-           status, start_time, end_time, duration_minutes, participants,
-           summary, record_path, transcript_md_path, google_doc_id, created_at
+           status,
+           (start_time AT TIME ZONE 'UTC') AS start_time,
+           (end_time AT TIME ZONE 'UTC') AS end_time,
+           duration_minutes, participants,
+           summary, record_path, transcript_md_path, google_doc_id,
+           (created_at AT TIME ZONE 'UTC') AS created_at
     FROM nb_meetings
     WHERE id = ${id} AND department_id = ${deptId}
     LIMIT 1

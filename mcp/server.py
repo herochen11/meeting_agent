@@ -148,7 +148,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "meet_id": {"type": "string", "description": "Google Meet ID 或完整連結"},
                     "chat_id": {"type": "string", "description": "TG 群組 chat_id，用於記錄會議所屬部門"},
-                    "bot_name": {"type": "string", "description": "Bot 在會議中顯示的名稱，預設 NoirsBoxes Meeting Bot"}
+                    "bot_name": {"type": "string", "description": "Bot 在會議中顯示的名稱，預設 NoirsBoxes 會議助理"}
                 },
                 "required": ["meet_id", "chat_id"]
             }
@@ -499,7 +499,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 # ── Vexa 工具實作 ─────────────────────────────────────────────
 
-async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsBoxes Meeting Bot") -> str:
+async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsBoxes 會議助理") -> str:
     meet_id = meet_id.strip().lower()
     if "meet.google.com/" in meet_id:
         meet_id = meet_id.split("meet.google.com/")[-1].split("?")[0]
@@ -517,6 +517,39 @@ async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsB
                 mapping = _read_meeting_map()
                 mapping[meet_id] = str(chat_id)
                 _write_meeting_map(mapping)
+
+                # INSERT 占位 row 到 nb_meetings（會議進行中），讓 Dashboard 立刻顯示
+                # 失敗只 log warning，不擋 join_meeting 本身成功
+                try:
+                    with _db_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT id FROM nb_departments WHERE chat_id = %s LIMIT 1",
+                                (str(chat_id),),
+                            )
+                            dept_row = cur.fetchone()
+                            if dept_row:
+                                dept_id = dept_row["id"]
+                                cur.execute(
+                                    """
+                                    INSERT INTO nb_meetings
+                                      (department_id, vexa_meeting_id, title, meet_id,
+                                       platform, status, start_time)
+                                    SELECT %s, %s, '待定', %s, 'Google Meet', '會議進行中', NOW()
+                                    WHERE NOT EXISTS (
+                                        SELECT 1 FROM nb_meetings
+                                        WHERE meet_id = %s AND status = '會議進行中'
+                                    )
+                                    """,
+                                    (dept_id, mid, meet_id, meet_id),
+                                )
+                            else:
+                                logger.warning(
+                                    f"join_meeting 占位 INSERT 跳過：找不到 chat_id={chat_id} 對應部門"
+                                )
+                except Exception as e:
+                    logger.warning(f"join_meeting 占位 INSERT 失敗（不影響派 bot）: {e}")
+
             return json.dumps({"success": True, "meet_id": meet_id, "meeting_id": mid}, ensure_ascii=False)
         elif r.status_code == 409:
             return json.dumps({"success": False, "reason": f"Bot 已在會議 {meet_id} 中"}, ensure_ascii=False)
@@ -625,20 +658,36 @@ async def _summarize_meeting(meeting_id: int, native_meeting_id: str = "", start
         "segments_count":    transcript_data.get("segments_count", 0),
         "transcript":        transcript_data.get("transcript", ""),
         "instruction":       (
-            "請根據以上逐字稿產生：\n\n"
-            "1. 會議摘要（8-15 句）\n"
-            "   - 涵蓋所有主要討論議題與決策結論，不只列結論，也要交代背景和討論脈絡\n"
-            "   - 重要數字、日期、承諾事項必須保留\n\n"
-            "2. Action Items（編號 MMDD_N）\n"
-            "   - 任務描述必須具體明確，包含：做什麼、為什麼、預期產出是什麼\n"
-            "   - ❌ 模糊：「處理韌體問題」\n"
-            "   - ✅ 具體：「修復 PD-35 韌體 v2.1 在快充模式下的斷電問題，完成後提供測試報告給 Brian 確認」\n"
-            "   - 如果逐字稿中有提到具體的規格、數字、對象，務必寫進任務描述\n"
-            "   - 每個 item 包含：負責人、截止日、優先級（高/中/低）\n\n"
-            "然後把 Action Items 寫入 Google Sheets（用 append_action_items），\n"
-            "在 Google Drive 建立會議記錄，並透過 TG 發送摘要給團隊。\n\n"
-            "⚠️ 語言處理：此會議以中文進行。逐字稿中如有整句英文，是語音辨識誤判（說中文但夾雜英文單字導致整句被轉為英文）。\n"
-            "寫入 Google Doc 時，請將這些英文段落翻譯為中文。產品型號、技術術語可保留英文原文。"
+            "請根據以上逐字稿產生結構化會議記錄：\n\n"
+            "【摘要格式】\n"
+            "1. 自動識別會議中討論的所有主要議題\n"
+            "2. 每個議題作為一個段落標題（用 ## 標記）\n"
+            "3. 每個議題下用條列式列出關鍵討論點\n"
+            "4. 重要的關鍵詞、人名、產品型號、數字用粗體標記\n"
+            "5. 如有明確結論或決策，直接寫在該議題下\n"
+            "6. 不要按時間順序，而是按主題分類歸納\n\n"
+            "摘要格式範例：\n"
+            "## 產品交期討論\n"
+            "- PD-35 訂單交期問題：**A 客戶**反映 6/15 趕不上會影響產線排程\n"
+            "- 工廠端確認可提前插單，但需額外支付 15% 加急費（約 **2 萬元**）\n"
+            "- 決議：先跟客戶確認能否接受 **6/10** 提前交貨，費用分攤方案待確認\n\n"
+            "## 韌體問題追蹤\n"
+            "- v2.1 快充模式斷電問題已定位，根因是 **PWM 頻率設定**錯誤\n"
+            "- 預計下週三前提供修復版本\n\n"
+            "【Action Items 格式】\n"
+            "- 編號規則：MMDD_N（如 0512_1）\n"
+            "- 任務描述必須具體明確，包含：做什麼、為什麼、預期產出\n"
+            "- 如逐字稿中有提到具體的規格、數字、對象，務必寫進任務描述\n"
+            "- ❌ 模糊：「處理韌體問題」\n"
+            "- ✅ 具體：「修復 PD-35 韌體 v2.1 快充模式斷電問題，完成後提供測試報告給 Brian 確認」\n"
+            "- 每個 item 包含：負責人、截止日、優先級（高/中/低）\n\n"
+            "【後續步驟】\n"
+            "1. 用 append_action_items 把 Action Items 寫入 nb_action_items DB（會自動同步寫 Google Sheets 副本）\n"
+            "2. 把對應 markdown 寫到 meeting_agent/records/{部門}/MMDD_{標題}_{meet_id}.md\n"
+            "   （此步驟會自動更新 nb_meetings.summary + transcript_md_path，Dashboard 直接讀此檔顯示）\n"
+            "3. 透過 TG 發送摘要到該部門群組（測試模式則改發 DM 給 Brian chat_id=1064895221）\n\n"
+            "❌ 不再寫 Google Doc — 長會議 Doc 寫入太慢，Dashboard 直接讀本地 markdown 即可。\n\n"
+            "⚠️ 語言處理：此會議以中文進行。逐字稿中如有整句英文，是語音辨識誤判（說中文但夾雜英文單字導致整句被轉為英文）。寫入 Markdown 時，請將這些英文段落翻譯為中文。產品型號、技術術語可保留英文原文。"
         )
     }, ensure_ascii=False)
 

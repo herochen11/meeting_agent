@@ -1,4 +1,5 @@
 import { NavLink, useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { CheckSquare, LogOut, Settings, Video } from 'lucide-react';
 
 import { getStoredDept, logout } from '../lib/auth';
@@ -16,10 +17,13 @@ const navItemClass = ({ isActive }: { isActive: boolean }) =>
 
 export default function Sidebar({ admin }: Props) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const dept = getStoredDept();
 
   async function handleLogout() {
     await logout();
+    // 清掉 React Query 所有快取，避免再登入別部門時看到舊資料
+    queryClient.clear();
     navigate('/login', { replace: true });
   }
 

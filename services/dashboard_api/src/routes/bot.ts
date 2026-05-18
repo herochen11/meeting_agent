@@ -89,11 +89,13 @@ botRoute.get("/api/bot/status", async (c) => {
   const allBots = Array.isArray(data.running_bots) ? data.running_bots : [];
 
   const map = await readMeetingMap();
-  const filtered = allBots.filter((b) => {
-    const meetId = typeof b.native_meeting_id === "string" ? b.native_meeting_id : null;
-    if (!meetId) return false;
-    return map[meetId] === chatId;
-  });
+  // 過濾本部門 + 把 native_meeting_id alias 成 meet_id（前端用 meet_id）
+  const filtered = allBots
+    .map((b) => {
+      const meetId = typeof b.native_meeting_id === "string" ? b.native_meeting_id : null;
+      return { ...b, meet_id: meetId };
+    })
+    .filter((b) => b.meet_id != null && map[b.meet_id] === chatId);
 
   return c.json({ count: filtered.length, bots: filtered });
 });
@@ -130,7 +132,7 @@ botRoute.post("/api/bot/join", async (c) => {
   const botName =
     typeof body.bot_name === "string" && body.bot_name.trim()
       ? body.bot_name.trim()
-      : "NoirsBoxes Meeting Bot";
+      : "NoirsBoxes 會議助理";
 
   const chatId = await getDeptChatId(deptId);
   if (!chatId) {
@@ -170,22 +172,51 @@ botRoute.post("/api/bot/join", async (c) => {
     id?: number;
     [key: string]: unknown;
   };
+  const vexaMeetingId = data.id ?? null;
 
   // 只在 Vexa 派發成功後才寫 meeting_map
+  let mapWarning: string | null = null;
   try {
     const map = await readMeetingMap();
     map[meetId] = chatId;
     await writeMeetingMap(map);
   } catch (err) {
-    // 派發成功但 map 寫失敗，回 200 但帶 warning
-    return c.json({
-      success: true,
-      meeting_id: data.id ?? null,
-      warning: `meeting_map.json 寫入失敗：${(err as Error).message}`,
-    });
+    mapWarning = `meeting_map.json 寫入失敗：${(err as Error).message}`;
   }
 
-  return c.json({ success: true, meeting_id: data.id ?? null });
+  // INSERT 占位 row 到 nb_meetings（會議進行中），讓 Dashboard 立刻顯示
+  // 失敗只 log warning，不擋整個 API 成功
+  let placeholderWarning: string | null = null;
+  try {
+    await sql`
+      INSERT INTO nb_meetings
+        (department_id, vexa_meeting_id, title, meet_id, platform, status, start_time)
+      SELECT ${deptId}, ${vexaMeetingId}, '待定', ${meetId}, 'Google Meet', '會議進行中', NOW()
+      WHERE NOT EXISTS (
+        SELECT 1 FROM nb_meetings
+        WHERE meet_id = ${meetId} AND status = '會議進行中'
+      )
+    `;
+  } catch (err) {
+    placeholderWarning = `nb_meetings 占位 INSERT 失敗（不影響派 bot）：${(err as Error).message}`;
+    console.warn(placeholderWarning);
+  }
+
+  const response: {
+    success: true;
+    meeting_id: number | null;
+    warning?: string;
+  } = {
+    success: true,
+    meeting_id: vexaMeetingId,
+  };
+  const warnings = [mapWarning, placeholderWarning].filter(
+    (w): w is string => w !== null,
+  );
+  if (warnings.length > 0) {
+    response.warning = warnings.join("; ");
+  }
+  return c.json(response);
 });
 
 interface StopBody {

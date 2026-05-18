@@ -1,17 +1,38 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Eye, EyeOff } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 import ErrorBanner from '../components/ErrorBanner';
 import LoadingSpinner from '../components/LoadingSpinner';
 import { api, type ActionItem, type MeetingDetailResponse } from '../lib/api';
 
-type Tab = 'summary' | 'items' | 'transcript';
+type Tab = 'summary' | 'items';
+
+const ownerColors = [
+  'bg-blue-100 text-blue-700',
+  'bg-emerald-100 text-emerald-700',
+  'bg-amber-100 text-amber-700',
+  'bg-purple-100 text-purple-700',
+  'bg-pink-100 text-pink-700',
+  'bg-cyan-100 text-cyan-700',
+  'bg-indigo-100 text-indigo-700',
+];
+
+function ownerChipColor(name: string | null): string {
+  if (!name) return 'bg-slate-100 text-slate-600';
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return ownerColors[h % ownerColors.length];
+}
 
 function formatDateTime(iso: string | null): string {
   if (!iso) return '—';
-  return new Date(iso).toLocaleString('zh-TW', { hour12: false });
+  // DB 存的是 UTC 但沒帶時區，要強制當 UTC 解析（補 Z），不然 JS 會當成本機時間
+  const isoUtc = iso.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + 'Z';
+  return new Date(isoUtc).toLocaleString('zh-TW', { hour12: false });
 }
 
 function ItemRow({ it }: { it: ActionItem }) {
@@ -50,9 +71,57 @@ function ItemRow({ it }: { it: ActionItem }) {
   );
 }
 
+/** 排序：未完成（未開始/進行中）優先，然後依負責人、code 二次排序 */
+function sortItems(items: ActionItem[]): ActionItem[] {
+  return [...items].sort((a, b) => {
+    const aDone = a.status === '已完成' ? 1 : 0;
+    const bDone = b.status === '已完成' ? 1 : 0;
+    if (aDone !== bDone) return aDone - bDone;
+
+    const aOwner = a.assignee ?? '￿'; // 未指派排最後
+    const bOwner = b.assignee ?? '￿';
+    const ownerCmp = aOwner.localeCompare(bOwner, 'zh-Hant');
+    if (ownerCmp !== 0) return ownerCmp;
+
+    const aCode = a.code ?? '';
+    const bCode = b.code ?? '';
+    return aCode.localeCompare(bCode);
+  });
+}
+
+/** 按負責人分組（保留 sortItems 後的順序） */
+function groupByOwner(items: ActionItem[]): Array<[string, ActionItem[]]> {
+  const m = new Map<string, ActionItem[]>();
+  for (const it of items) {
+    const key = it.assignee ?? '未指派';
+    if (!m.has(key)) m.set(key, []);
+    m.get(key)!.push(it);
+  }
+  return [...m.entries()];
+}
+
+function OwnerGroup({ owner, items }: { owner: string; items: ActionItem[] }) {
+  return (
+    <div className="space-y-2">
+      <div
+        className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${ownerChipColor(owner)}`}
+      >
+        {owner}
+        <span className="ml-1 opacity-70">({items.length})</span>
+      </div>
+      <div className="grid gap-2 md:grid-cols-2">
+        {items.map((it) => (
+          <ItemRow key={it.id} it={it} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function MeetingDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [tab, setTab] = useState<Tab>('summary');
+  const [showCompleted, setShowCompleted] = useState(false);
 
   const { data, isLoading, error } = useQuery<MeetingDetailResponse>({
     queryKey: ['meeting', id],
@@ -60,11 +129,17 @@ export default function MeetingDetailPage() {
     enabled: !!id,
   });
 
-  const transcriptQuery = useQuery<{ markdown: string }>({
-    queryKey: ['meeting', id, 'transcript'],
-    queryFn: () => api.get<{ markdown: string }>(`/api/meetings/${id}/transcript`),
-    enabled: !!id && tab === 'transcript',
-  });
+  const { pending, completed } = useMemo(() => {
+    const items = data?.action_items ?? [];
+    const sorted = sortItems(items);
+    return {
+      pending: sorted.filter((it) => it.status !== '已完成'),
+      completed: sorted.filter((it) => it.status === '已完成'),
+    };
+  }, [data]);
+
+  const pendingGroups = useMemo(() => groupByOwner(pending), [pending]);
+  const completedGroups = useMemo(() => groupByOwner(completed), [completed]);
 
   if (isLoading) return <LoadingSpinner />;
   if (error) return <ErrorBanner error={error} />;
@@ -107,9 +182,8 @@ export default function MeetingDetailPage() {
 
       <div className="flex gap-1 border-b border-slate-200">
         {[
-          { k: 'summary', label: '摘要' },
+          { k: 'summary', label: '總結' },
           { k: 'items', label: `Action Items (${action_items.length})` },
-          { k: 'transcript', label: '逐字稿' },
         ].map((t) => (
           <button
             key={t.k}
@@ -129,34 +203,56 @@ export default function MeetingDetailPage() {
       {tab === 'summary' && (
         <div className="rounded-md border border-slate-200 bg-white p-5">
           {meeting.summary ? (
-            <p className="whitespace-pre-wrap text-sm leading-7 text-slate-700">
-              {meeting.summary}
-            </p>
+            <div className="prose prose-slate prose-sm max-w-none">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{meeting.summary}</ReactMarkdown>
+            </div>
           ) : (
-            <p className="text-sm text-slate-400">尚未產生摘要</p>
+            <p className="text-sm text-slate-400">尚未產生總結</p>
           )}
         </div>
       )}
 
       {tab === 'items' && (
-        <div className="grid gap-2 md:grid-cols-2">
+        <div className="space-y-5">
           {action_items.length === 0 && (
             <div className="text-sm text-slate-500">此會議目前沒有 Action Items</div>
           )}
-          {action_items.map((it) => (
-            <ItemRow key={it.id} it={it} />
-          ))}
-        </div>
-      )}
 
-      {tab === 'transcript' && (
-        <div className="rounded-md border border-slate-200 bg-white p-5">
-          {transcriptQuery.isLoading && <LoadingSpinner label="載入逐字稿…" />}
-          {transcriptQuery.error && <ErrorBanner error={transcriptQuery.error} />}
-          {transcriptQuery.data && (
-            <pre className="whitespace-pre-wrap text-xs leading-6 text-slate-700">
-              {transcriptQuery.data.markdown || '尚無逐字稿'}
-            </pre>
+          {pending.length > 0 && (
+            <div className="space-y-4">
+              <div className="text-xs font-medium text-slate-500">
+                未完成（{pending.length}）
+              </div>
+              {pendingGroups.map(([owner, ownerItems]) => (
+                <OwnerGroup key={owner} owner={owner} items={ownerItems} />
+              ))}
+            </div>
+          )}
+
+          {completed.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between border-t border-slate-200 pt-4">
+                <div className="text-xs font-medium text-slate-500">
+                  已完成（{completed.length}）
+                </div>
+                <button
+                  onClick={() => setShowCompleted((v) => !v)}
+                  title={showCompleted ? '收起已完成' : '展開已完成'}
+                  className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition ${
+                    showCompleted
+                      ? 'bg-blue-100 text-blue-700 hover:bg-blue-200'
+                      : 'bg-white text-slate-500 hover:bg-slate-100'
+                  }`}
+                >
+                  {showCompleted ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                  {showCompleted ? '收起' : '展開'}
+                </button>
+              </div>
+              {showCompleted &&
+                completedGroups.map(([owner, ownerItems]) => (
+                  <OwnerGroup key={owner} owner={owner} items={ownerItems} />
+                ))}
+            </div>
           )}
         </div>
       )}

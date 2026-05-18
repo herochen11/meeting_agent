@@ -54,21 +54,33 @@ export default function BotConsole() {
             : '目前沒有 bot 在會議中'}
       </div>
 
-      {data?.bots.map((b) => (
-        <div
-          key={b.meet_id}
-          className="flex items-center justify-between rounded border border-slate-200 px-2 py-1"
-        >
-          <span className="font-mono text-xs">{b.meet_id}</span>
-          <button
-            onClick={() => stopMut.mutate(b.meet_id)}
-            className="flex items-center gap-1 rounded bg-red-50 px-2 py-1 text-xs text-red-600 hover:bg-red-100"
-          >
-            <LogOut className="h-3 w-3" />
-            停止
-          </button>
+      {data && data.bots.length > 0 && (
+        <div className="space-y-1">
+          {data.bots.map((b) => (
+            <div
+              key={b.meet_id}
+              className="space-y-1 rounded border border-slate-200 px-2 py-1.5"
+            >
+              <div className="flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-emerald-500 animate-pulse" />
+                <span
+                  className="font-mono text-xs text-slate-700 truncate"
+                  title={b.meet_id}
+                >
+                  {b.meet_id}
+                </span>
+              </div>
+              <button
+                onClick={() => stopMut.mutate(b.meet_id)}
+                className="flex w-full items-center justify-center gap-1 rounded bg-red-50 px-2 py-1 text-xs text-red-600 whitespace-nowrap hover:bg-red-100"
+              >
+                <LogOut className="h-3 w-3" />
+                停止 bot
+              </button>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
 
       <div className="flex gap-1">
         <input

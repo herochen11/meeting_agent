@@ -24,7 +24,7 @@
 ## 可用工具
 
 ### Vexa MCP
-- `join_meeting` — 送 bot 進 Google Meet（預設名稱：NoirsBoxes Meeting Bot）
+- `join_meeting` — 送 bot 進 Google Meet（預設名稱：NoirsBoxes 會議助理）
 - `stop_bot` — 停止 bot
 - `get_status` — 查詢 bot 狀態
 - `get_meetings` — 列出最近會議
@@ -162,9 +162,13 @@ NoirsBoxes 會議管理/
 
 ---
 
-## 會議記錄格式（Google Doc）
+## 會議記錄格式（本地 Markdown）
 
-每場會議結束後，在當月資料夾建立一個 Google Doc：
+⚠️ 注意：自 2026-05-18 起，**會議記錄不再寫入 Google Doc**，只寫本地 markdown 檔（`meeting_agent/records/{部門}/`）。
+Dashboard 從 markdown 檔直接讀取顯示。
+歷史的 Google Doc 仍保留供查閱。
+
+每場會議結束後，在對應部門資料夾下產生一個 markdown 檔（命名 `MMDD_{標題}_{meet_id}.md`），格式如下：
 
 ```
 會議日期：YYYY-MM-DD
@@ -172,14 +176,16 @@ Meet ID：xxx-xxxx-xxx
 平台：Google Meet
 參與者：Brian, Ron, ...
 
-## 摘要
-8-15 句的完整會議摘要，涵蓋所有主要討論議題與決策結論。
-不只列結論，也要交代討論背景和脈絡。
-重要數字、日期、承諾事項必須保留。
+## {議題 1 標題}
+- 關鍵討論點，**重要詞用粗體**
+- 結論 / 決議直接寫在這
+
+## {議題 2 標題}
+- ...
 
 ## Action Items
-• 0428_1 準備客戶提案 — Brian · 截止 5/2
-• 0428_2 修復韌體錯誤 — Ron · 截止 4/30
+- 0428_1 準備客戶提案 — Brian · 截止 5/2
+- 0428_2 修復韌體錯誤 — Ron · 截止 4/30
 
 ## 逐字稿
 [00:00] Brian: 今天主要討論...
@@ -187,9 +193,11 @@ Meet ID：xxx-xxxx-xxx
 ...（完整逐字稿）
 ```
 
+說明：摘要部分自動依會議內容識別主要議題，每個議題用 `## 標題` 起一段，下面用條列列出關鍵討論點，重要關鍵詞（人名、產品型號、數字、決議）用粗體標記。不要按時間順序，按主題分類歸納。
+
 ### 逐字稿語言處理
 - 會議以中文進行，但語音辨識偶爾會把夾雜英文單字的中文句子整句轉為英文
-- 寫入 Google Doc 時，將這些被誤判的英文段落翻譯為中文
+- 寫入本地 markdown 時，將這些被誤判的英文段落翻譯為中文
 - 產品型號（如 PD-35）、技術術語（如 USB-C）保留英文原文
 - 摘要和 Action Items 一律使用繁體中文
 
@@ -248,30 +256,44 @@ NoirsBoxes {部門名稱} — YYYY 年 M 月會議報告
 ### 收到會議結束通知時
 當你看到 `<channel source="vexa-webhook">` 的會議結束通知：
 1. 呼叫 `summarize_meeting` 取得逐字稿
-2. 產生摘要和 Action Items（含 MMDD_N 編號）
-3. 寫入該部門的 Action Items Google Sheet（append）
-4. 在該月資料夾建立會議記錄 Google Doc
-5. 透過 TG 發送摘要和確認訊息
+2. 產生摘要和 Action Items（含 MMDD_N 編號，按新版議題式 prompt 格式）
+3. UPSERT 到 `nb_meetings`：
+   - 先查是否已有同 meet_id 且 status IN ('會議進行中', '逐字稿處理中') 的占位 row
+     - 派發 bot 時建立 `會議進行中`，webhook 進來時 webhook-channel.ts 會自動改成 `逐字稿處理中`
+   - 有 → UPDATE 該 row（title 改為議題式摘要的第一個議題或自動產生標題、status='completed'、end_time、summary、participants、transcript_md_path 等）
+   - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程）
+4. 用 `append_action_items` 寫入（自動雙寫 DB + Google Sheets 副本）
+5. 寫入本地 markdown：`meeting_agent/records/{部門}/MMDD_{標題}_{meet_id}.md`
+   - 完整內容：metadata + 議題式摘要 + Action Items + 完整逐字稿
+   - 同時更新 `nb_meetings.summary` + `transcript_md_path`（步驟 3 的 UPDATE / INSERT 可一併處理）
+6. 透過 TG 發送摘要和確認訊息（測試模式則改發 DM 給 Brian chat_id=1064895221）
+7. ❌ 不再寫 Google Doc — 長會議 Doc 寫入太慢，Dashboard 直接讀本地 md 顯示即可
 
-### TG 通知格式
-發送摘要時必須包含以下連結：
+### TG 通知格式（會議結束）
+
+發送會議結束通知時：
+1. **不再貼 Action Items 表格在訊息中**（客戶不愛 TG 內條列）
+2. **不再貼 Action Items Sheet 連結**
+3. **改成附上 Excel 檔**（依該部門全部未完成 Action Items 整理：依負責人分組、僅含未開始 + 進行中、排除已完成）
+4. Excel 從 `dashboard_api` 的 `GET /api/action-items/export.xlsx` 取（需 dept 登入）或用 sub-agent 直接生成
+
+訊息格式：
 ```
 📋 會議結束
 MMDD 會議主題
 
-摘要：...
+【總結】
+{議題式摘要 — 第一個議題 + 條列}
 
-✅ Action Items（N）
-🔴 0505_1 任務描述 — 負責人 · 截止 5/10
-🟡 0505_2 ...
-
-📊 Action Items Sheet：https://docs.google.com/spreadsheets/d/xxx
-📄 會議記錄：https://docs.google.com/document/d/xxx
+📎 附檔：{部門名稱}-未完成-{YYYY-MM-DD}.xlsx
+（含本部門所有未完成 Action Items，依負責人分組）
 
 ────────────────────
-📌 請確認以上 Action Items
+📌 本次會議產生 N 個新 Action Item（已寫入 DB 並同步 Sheet）
 如需修改請直接 @我
 ```
+
+Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegram_telegram__reply` 呼叫裡。
 
 ### Google Calendar 自動加入
 - 每 1 分鐘檢查 Google Calendar
@@ -371,14 +393,20 @@ MMDD 會議主題
 #### Sub-agent 委派範例
 
 ```
-請生成 sub-agent 處理此會議摘要：meeting_id=7, chat_id=-5269102871。
+請生成 sub-agent 處理此會議摘要：meeting_id=7, chat_id=-5269102871, meet_id=xxx-xxxx-xxx。
 執行步驟：
 1. 呼叫 send_processing(chat_id) 發送處理中提示
 2. 呼叫 summarize_meeting(meeting_id=7) 取得逐字稿
 3. 產生摘要和 Action Items
-4. 寫入 Google Sheets、建立 Google Doc
-5. 用 edit_message 更新狀態為完成
-6. 發送完整摘要到 TG 群組
+4. UPSERT 到 nb_meetings：
+   - 先 SELECT 同 meet_id 且 status='會議進行中' 的占位 row（派發 bot 時建立）
+   - 有 → UPDATE 該 row（title=正式標題, status='completed', end_time=NOW(),
+     summary=..., participants=..., transcript_md_path=...）
+   - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程）
+5. 用 append_action_items 寫入（雙寫 DB + Google Sheets 副本）
+6. 寫入本地 markdown：meeting_agent/records/{部門}/MMDD_{標題}_{meet_id}.md
+7. 用 edit_message 更新狀態為完成
+8. 發送完整摘要到 TG 群組
 ```
 
 ---
