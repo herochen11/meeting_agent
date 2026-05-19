@@ -65,7 +65,7 @@ const nbSql = postgres(NB_DATABASE_URL, {
 });
 
 /**
- * 用 meet_id 查 nb_meetings JOIN nb_departments，取得 chat_id + dept_id + 部門名稱
+ * 用 meet_id 查 nb_meetings JOIN nb_departments，取得 chat_id + dept_id + 部門名稱 + nb_meetings.id
  * 部門歸屬以派發 bot 時寫入的 nb_meetings.department_id 為唯一來源
  * 若 DB 查不到才 fallback 讀 meeting_map.json
  */
@@ -73,16 +73,23 @@ async function lookupDeptByMeetId(meetId: string): Promise<{
   chatId: string;
   deptId: string;
   deptName: string;
+  nbMeetingId: string;
   source: "db" | "meeting_map_fallback" | "none";
 }> {
-  if (!meetId) return { chatId: "", deptId: "", deptName: "", source: "none" };
+  if (!meetId) return { chatId: "", deptId: "", deptName: "", nbMeetingId: "", source: "none" };
 
   // 主路徑：DB lookup（dispatch-source-of-truth）
   try {
     const rows = await nbSql<
-      { chat_id: string | null; dept_id: number | null; dept_name: string | null }[]
+      {
+        nb_meeting_id: number | null;
+        chat_id: string | null;
+        dept_id: number | null;
+        dept_name: string | null;
+      }[]
     >`
-      SELECT d.chat_id AS chat_id,
+      SELECT m.id AS nb_meeting_id,
+             d.chat_id AS chat_id,
              m.department_id AS dept_id,
              d.name AS dept_name
       FROM nb_meetings m
@@ -97,6 +104,7 @@ async function lookupDeptByMeetId(meetId: string): Promise<{
         chatId: first.chat_id,
         deptId: String(first.dept_id ?? ""),
         deptName: first.dept_name ?? "",
+        nbMeetingId: String(first.nb_meeting_id ?? ""),
         source: "db",
       };
     }
@@ -116,13 +124,13 @@ async function lookupDeptByMeetId(meetId: string): Promise<{
     const v = map[meetId];
     if (typeof v === "string" && v) {
       log(`⚠️  Fallback to meeting_map.json for meet_id=${meetId} → ${v}（DB 查不到，僅供緊急備援）`);
-      return { chatId: v, deptId: "", deptName: "", source: "meeting_map_fallback" };
+      return { chatId: v, deptId: "", deptName: "", nbMeetingId: "", source: "meeting_map_fallback" };
     }
   } catch (err) {
     log(`meeting_map.json fallback error for meet_id=${meetId}: ${err}`);
   }
 
-  return { chatId: "", deptId: "", deptName: "", source: "none" };
+  return { chatId: "", deptId: "", deptName: "", nbMeetingId: "", source: "none" };
 }
 
 // 建立 MCP 伺服器並聲明為 channel
@@ -311,8 +319,9 @@ Bun.serve({
         const content = [
           `🎙️ 本地錄音完成`,
           ``,
-          `部門 ID: ${deptId}, Meet ID: ${meetId}, 時長: ${duration ?? "?"}s`,
-          `標題: ${title}`,
+          `本地錄音 (Meet ID: ${meetId}) 已完成轉錄。`,
+          `部門：dept_id=${deptId ?? "?"}, 時長：${duration ?? "?"}s`,
+          `標題：${title}`,
           ``,
           `⚠️ 部門歸屬規則（嚴格遵守）`,
           `dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 / 錄音建立時寫入的）。`,
@@ -324,14 +333,18 @@ Bun.serve({
           `Sub-agent 執行步驟：`,
           `1. 用 mcp__plugin_telegram_telegram__reply(chat_id=1064895221, "⏳ 處理本地錄音中...") 發送處理中提示給 Brian，記下回傳的 message_id`,
           `2. 用新版議題式 prompt 從附帶的逐字稿產生摘要 + Action Items（MMDD_N 編號）`,
-          `3. UPSERT nb_meetings (meet_id=${meetId})：`,
-          `   - UPDATE 現有 row → status='completed', title=正式標題, summary=議題式摘要,`,
+          `3. UPSERT nb_meetings（依 meet_id 查自己的 row）：`,
+          `   SELECT id, department_id FROM nb_meetings`,
+          `   WHERE meet_id='${meetId}' AND status IN ('會議進行中','逐字稿處理中')`,
+          `   ORDER BY id DESC LIMIT 1;`,
+          `   - 找到 → UPDATE SET status='completed', title=正式標題, summary=議題式摘要,`,
           `     end_time=NOW(), duration_minutes=${duration ? Math.round(duration / 60) : "null"},`,
           `     transcript_md_path=...（記得保留 source='local-recording'）`,
           `     ❗ 不要動 department_id，建立時寫入的就是正確的`,
+          `   - 沒找到 → INSERT 新 row（兼容歷史 / 手動加入）`,
           `4. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${meetId}.md`,
           `   - 含 metadata、議題式摘要、Action Items、完整逐字稿`,
-          `5. 用 append_action_items 寫入 nb_action_items DB（department_id 用步驟 3 的 row）`,
+          `5. 用 append_action_items(dept="<部門名稱>" 或 chat_id="<群組 chat_id>", items=[...]) 寫入 nb_action_items DB`,
           `6. 用 mcp__plugin_telegram_telegram__edit_message(chat_id=1064895221, message_id, "✅ 處理完成") 更新處理中訊息`,
           `7. 用 mcp__plugin_telegram_telegram__reply 發新訊息 DM Brian (chat_id=1064895221) 帶完整摘要 + Dashboard 連結（觸發推撥）`,
           `   ⚠️ 本地錄音不走 TG 群組，只 DM Brian`,
@@ -431,13 +444,17 @@ Bun.serve({
         );
 
         // 按官方格式推 channel notification
+        // Option B：channel 訊息只露出 meet_id（Google Meet code），不暴露任何 numeric ID
+        // Sub-agent 內部需要 numeric ID 時自己查 DB：
+        //   - Vexa 內部 id：SELECT id FROM meetings WHERE platform_specific_id=? ORDER BY id DESC LIMIT 1
+        //   - nb_meetings.id：SELECT id FROM nb_meetings WHERE meet_id=? AND status IN ('會議進行中','逐字稿處理中') ORDER BY id DESC LIMIT 1
         const content = [
           `🔔 會議結束通知`,
           ``,
-          `會議 (DB ID: ${meetingId}, Meet ID: ${nativeMeetingId}) 已結束。`,
+          `會議 (Meet ID: ${nativeMeetingId}) 已結束。`,
           deptInfo.chatId
-            ? `部門：${deptInfo.deptName || "(未知)"} (dept_id=${deptInfo.deptId || "?"}, chat_id=${deptInfo.chatId})`
-            : `⚠️ 部門查無對應（DB 與 meeting_map.json 都沒命中），請依 chat_id 重新確認後處理`,
+            ? `部門：${deptInfo.deptName || "(未知)"}（dept_id=${deptInfo.deptId || "?"}, chat_id=${deptInfo.chatId}）`
+            : `⚠️ 部門查無對應（DB 與 meeting_map.json 都沒命中），請依 meet_id 重新確認後處理`,
           ``,
           `⚠️ 部門歸屬規則（嚴格遵守）`,
           `dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 bot 時寫入的）。`,
@@ -448,15 +465,20 @@ Bun.serve({
           ``,
           `Sub-agent 執行步驟：`,
           `1. 用 mcp__plugin_telegram_telegram__reply(chat_id=${deptInfo.chatId || "<部門 chat_id>"}, "⏳ 處理中...") 發送處理中提示，記下回傳的 message_id`,
-          `2. 呼叫 summarize_meeting(meeting_id=${meetingId}) 取得逐字稿`,
-          `   - native_meeting_id: ${nativeMeetingId}`,
-          `3. 產生摘要和 Action Items`,
-          `4. UPSERT nb_meetings：`,
-          `   - SELECT 同 meet_id 的占位 row（派發 bot 時建立，department_id 為派發來源）`,
-          `   - 有 → UPDATE 該 row（title=正式標題, status='completed', end_time=NOW(), summary=..., transcript_md_path=...）`,
+          `2. 查 Vexa 內部 meeting id（summarize_meeting 需要 numeric id）：`,
+          `   docker exec vexa-postgres-1 psql -U postgres -d vexa -tAc "\\`,
+          `     SELECT id FROM meetings WHERE platform_specific_id='${nativeMeetingId}' ORDER BY id DESC LIMIT 1;"`,
+          `   然後呼叫 mcp__vexa__summarize_meeting(meeting_id=<查到的 id>) 取得逐字稿`,
+          `3. 用新版議題式 prompt 產生摘要和 Action Items（MMDD_N 編號）`,
+          `4. UPSERT nb_meetings（依 meet_id 查自己的 row）：`,
+          `   SELECT id, department_id FROM nb_meetings`,
+          `   WHERE meet_id='${nativeMeetingId}' AND status IN ('會議進行中','逐字稿處理中')`,
+          `   ORDER BY id DESC LIMIT 1;`,
+          `   - 找到 → UPDATE SET title=正式標題, status='completed', end_time=NOW(),`,
+          `     summary=議題式摘要, transcript_md_path=...`,
           `     ❗ 不要動 department_id，派發時寫入的就是正確的`,
-          `   - 沒有 → INSERT 新 row，department_id 依 chat_id 查 nb_departments`,
-          `5. 用 append_action_items 把 Action Items 寫入 nb_action_items DB（department_id 用步驟 4 的 row）`,
+          `   - 沒找到 → INSERT 新 row（兼容歷史 / 手動加入），department_id 依 chat_id 查 nb_departments`,
+          `5. 用 append_action_items(chat_id="${deptInfo.chatId || "<部門 chat_id>"}", items=[...]) 寫入 nb_action_items DB`,
           `6. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${nativeMeetingId}.md`,
           `   （含 metadata、議題式摘要、Action Items、完整逐字稿；自動更新 nb_meetings.summary + transcript_md_path）`,
           `7. 用 mcp__plugin_telegram_telegram__edit_message(chat_id, message_id, "✅ 處理完成") 更新處理中訊息`,
@@ -470,8 +492,8 @@ Bun.serve({
             content: content,
             meta: {
               event: eventType,
-              meeting_id: String(meetingId),
-              native_meeting_id: nativeMeetingId,
+              // Option B：對外只暴露 meet_id；numeric ID 由 sub-agent 自己查 DB
+              meet_id: nativeMeetingId,
               platform: platform,
               start_time: startTime,
               end_time: endTime,

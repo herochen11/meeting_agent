@@ -246,11 +246,17 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="append_action_items",
-            description="把 Action Items 新增到 Google Sheets（append 新行）。",
+            description=(
+                "把 Action Items 寫入 nb_action_items DB（DB 為唯一寫入位置，不再寫 Google Sheets）。\n"
+                "部門識別優先順序：chat_id → dept（部門名稱）→ spreadsheet_id（向後相容）。\n"
+                "至少要提供其中一個。"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "spreadsheet_id": {"type": "string", "description": "Google Sheet ID"},
+                    "chat_id": {"type": "string", "description": "TG 群組 chat_id（推薦，部門 lookup 主要 key）"},
+                    "dept": {"type": "string", "description": "部門名稱（chat_id 不可用時的替代 key）"},
+                    "spreadsheet_id": {"type": "string", "description": "（已淘汰）舊版 sheet_id；若 chat_id/dept 都沒帶才會 fallback 查 nb_departments.sheet_id"},
                     "items": {
                         "type": "array",
                         "description": "Action Items 陣列",
@@ -270,16 +276,21 @@ async def list_tools() -> list[types.Tool]:
                         }
                     }
                 },
-                "required": ["spreadsheet_id", "items"]
+                "required": ["items"]
             }
         ),
         types.Tool(
             name="update_action_item",
-            description="更新 Google Sheets 中某個 Action Item 的欄位（狀態、負責人、截止日等）。",
+            description=(
+                "更新 nb_action_items DB 中某個 Action Item 的欄位（狀態、負責人、截止日等）。\n"
+                "部門識別優先順序：chat_id → dept → spreadsheet_id（向後相容）。至少要提供其中一個。"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "spreadsheet_id": {"type": "string", "description": "Google Sheet ID"},
+                    "chat_id": {"type": "string", "description": "TG 群組 chat_id（推薦）"},
+                    "dept": {"type": "string", "description": "部門名稱"},
+                    "spreadsheet_id": {"type": "string", "description": "（已淘汰）舊版 sheet_id"},
                     "item_id": {"type": "string", "description": "Action Item 編號，如 0505_1"},
                     "updates": {
                         "type": "object",
@@ -294,7 +305,7 @@ async def list_tools() -> list[types.Tool]:
                         }
                     }
                 },
-                "required": ["spreadsheet_id", "item_id", "updates"]
+                "required": ["item_id", "updates"]
             }
         ),
         types.Tool(
@@ -448,12 +459,17 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "append_action_items":
             result = await asyncio.to_thread(
-                _append_action_items, arguments.get("spreadsheet_id", ""), arguments.get("items", [])
+                _append_action_items,
+                arguments.get("spreadsheet_id", ""),
+                arguments.get("items", []),
+                arguments.get("chat_id", ""),
+                arguments.get("dept", ""),
             )
         elif name == "update_action_item":
             result = await asyncio.to_thread(
                 _update_action_item, arguments.get("spreadsheet_id", ""),
-                arguments.get("item_id", ""), arguments.get("updates", {})
+                arguments.get("item_id", ""), arguments.get("updates", {}),
+                arguments.get("chat_id", ""), arguments.get("dept", ""),
             )
         elif name == "get_action_items":
             result = await asyncio.to_thread(
@@ -827,19 +843,81 @@ def _mmdd_from_date(date_str: str) -> str:
     return now.strftime("%m%d")
 
 
-def _append_action_items(spreadsheet_id: str, items: list) -> str:
+def _resolve_dept(cur, *, chat_id: str = "", dept: str = "", spreadsheet_id: str = "") -> dict | None:
+    """多路徑解析部門：chat_id → dept（部門名稱）→ spreadsheet_id（向後相容）。
+
+    回傳 {"id": int, "name": str} 或 None。caller 須提供開啟中的 cursor。
+    """
+    chat_id = (chat_id or "").strip()
+    dept = (dept or "").strip()
+    spreadsheet_id = (spreadsheet_id or "").strip()
+
+    # 1) chat_id（推薦）
+    if chat_id:
+        cur.execute(
+            "SELECT id, name FROM nb_departments WHERE chat_id = %s LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {"id": row["id"], "name": row["name"]}
+
+    # 2) 部門名稱（精確比對）
+    if dept:
+        cur.execute(
+            "SELECT id, name FROM nb_departments WHERE name = %s LIMIT 1",
+            (dept,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {"id": row["id"], "name": row["name"]}
+
+    # 3) spreadsheet_id（向後相容）
+    if spreadsheet_id:
+        cur.execute(
+            "SELECT id, name FROM nb_departments WHERE sheet_id = %s LIMIT 1",
+            (spreadsheet_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {"id": row["id"], "name": row["name"]}
+
+        # 最後 fallback：spreadsheet_id 可能其實是 chat_id（caller 傳錯位置）
+        cur.execute(
+            "SELECT id, name FROM nb_departments WHERE chat_id = %s LIMIT 1",
+            (spreadsheet_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            logger.warning(
+                f"_resolve_dept: spreadsheet_id={spreadsheet_id} 實際是 chat_id（請改傳 chat_id 參數）"
+            )
+            return {"id": row["id"], "name": row["name"]}
+
+    return None
+
+
+def _append_action_items(
+    spreadsheet_id: str,
+    items: list,
+    chat_id: str = "",
+    dept: str = "",
+) -> str:
     """把 Action Items 寫入 DB（唯一寫入位置）。
 
     每個 item 若沒帶 id，自動產生 code（MMDD_N）。
     若 source_meeting (meet_id) 存在於 nb_meetings，會關聯 meeting_id。
 
-    注意：自 2026-05-19 起不再寫入 Google Sheets 副本，DB 為唯一資料來源。
-    `spreadsheet_id` 保留作為部門識別（透過 nb_departments.sheet_id 查 dept_id）。
+    部門識別優先順序：chat_id → dept（部門名稱）→ spreadsheet_id（向後相容）。
+    自 2026-05-19 起不再寫入 Google Sheets 副本，DB 為唯一資料來源。
     """
-    if not spreadsheet_id:
-        return json.dumps({"success": False, "error": "缺少 spreadsheet_id"}, ensure_ascii=False)
     if not items:
         return json.dumps({"success": False, "error": "items 為空"}, ensure_ascii=False)
+    if not (chat_id or dept or spreadsheet_id):
+        return json.dumps({
+            "success": False,
+            "error": "缺少部門識別參數（chat_id / dept / spreadsheet_id 至少要提供一個）"
+        }, ensure_ascii=False)
 
     # ── DB 寫入 ──
     try:
@@ -853,18 +931,20 @@ def _append_action_items(spreadsheet_id: str, items: list) -> str:
         try:
             with conn:
                 with conn.cursor() as cur:
-                    # 查 department_id
-                    cur.execute(
-                        "SELECT id, name FROM nb_departments WHERE sheet_id = %s LIMIT 1",
-                        (spreadsheet_id,),
+                    # 查 department_id（多路徑 lookup）
+                    dept_row = _resolve_dept(
+                        cur, chat_id=chat_id, dept=dept, spreadsheet_id=spreadsheet_id
                     )
-                    dept = cur.fetchone()
-                    if not dept:
+                    if not dept_row:
                         return json.dumps({
                             "success": False,
-                            "error": f"找不到對應部門（sheet_id={spreadsheet_id} 未在 nb_departments 登記）"
+                            "error": (
+                                f"找不到對應部門（chat_id={chat_id or '(empty)'}, "
+                                f"dept={dept or '(empty)'}, "
+                                f"spreadsheet_id={spreadsheet_id or '(empty)'} 都無法解析）"
+                            )
                         }, ensure_ascii=False)
-                    dept_id = dept["id"]
+                    dept_id = dept_row["id"]
 
                     # 預先把每 item 補 code（避免後續 INSERT 撞號）
                     # 同一 batch 內遞增當天計數
@@ -953,14 +1033,25 @@ def _append_action_items(spreadsheet_id: str, items: list) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _update_action_item(spreadsheet_id: str, item_id: str, updates: dict) -> str:
+def _update_action_item(
+    spreadsheet_id: str,
+    item_id: str,
+    updates: dict,
+    chat_id: str = "",
+    dept: str = "",
+) -> str:
     """根據編號找到 Action Item 並更新指定欄位（DB 為唯一寫入位置）。
 
-    自 2026-05-19 起不再同步 Google Sheets — `spreadsheet_id` 保留作為部門識別
-    （透過 nb_departments.sheet_id 查 dept_id）。
+    部門識別優先順序：chat_id → dept（部門名稱）→ spreadsheet_id（向後相容）。
+    自 2026-05-19 起不再同步 Google Sheets。
     """
-    if not spreadsheet_id or not item_id:
-        return json.dumps({"success": False, "error": "缺少 spreadsheet_id 或 item_id"}, ensure_ascii=False)
+    if not item_id:
+        return json.dumps({"success": False, "error": "缺少 item_id"}, ensure_ascii=False)
+    if not (chat_id or dept or spreadsheet_id):
+        return json.dumps({
+            "success": False,
+            "error": "缺少部門識別參數（chat_id / dept / spreadsheet_id 至少要提供一個）"
+        }, ensure_ascii=False)
     if not updates:
         return json.dumps({"success": False, "error": "updates 為空"}, ensure_ascii=False)
 
@@ -1004,22 +1095,39 @@ def _update_action_item(spreadsheet_id: str, item_id: str, updates: dict) -> str
         try:
             with conn:
                 with conn.cursor() as cur:
-                    # 查 row id（透過 sheet_id 限定部門範圍，避免跨部門同名 code 撞車）
+                    # 多路徑解析部門
+                    dept_row = _resolve_dept(
+                        cur, chat_id=chat_id, dept=dept, spreadsheet_id=spreadsheet_id
+                    )
+                    if not dept_row:
+                        return json.dumps({
+                            "success": False,
+                            "error": (
+                                f"找不到對應部門（chat_id={chat_id or '(empty)'}, "
+                                f"dept={dept or '(empty)'}, "
+                                f"spreadsheet_id={spreadsheet_id or '(empty)'} 都無法解析）"
+                            )
+                        }, ensure_ascii=False)
+                    dept_id_lookup = dept_row["id"]
+
+                    # 查 row id（用 dept_id 限定部門範圍，避免跨部門同名 code 撞車）
                     cur.execute(
                         """
-                        SELECT ai.id
-                        FROM nb_action_items ai
-                        JOIN nb_departments d ON ai.department_id = d.id
-                        WHERE d.sheet_id = %s AND ai.code = %s
+                        SELECT id
+                        FROM nb_action_items
+                        WHERE department_id = %s AND code = %s
                         LIMIT 1
                         """,
-                        (spreadsheet_id, item_id),
+                        (dept_id_lookup, item_id),
                     )
                     row = cur.fetchone()
                     if not row:
                         return json.dumps({
                             "success": False,
-                            "error": f"找不到對應 Action Item (sheet_id={spreadsheet_id}, code={item_id})"
+                            "error": (
+                                f"找不到對應 Action Item (dept_id={dept_id_lookup} "
+                                f"[{dept_row['name']}], code={item_id})"
+                            )
                         }, ensure_ascii=False)
                     db_row_id = row["id"]
 
