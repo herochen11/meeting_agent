@@ -1,11 +1,29 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { CheckCircle2, Loader2, Mic, Square } from 'lucide-react';
+import { CheckCircle2, Loader2, Mic, Square, Upload, FileAudio } from 'lucide-react';
 
 import ErrorBanner from '../components/ErrorBanner';
 import { getStoredDept } from '../lib/auth';
 
 type Phase = 'idle' | 'recording' | 'uploading' | 'done';
+type UploadPhase = 'idle' | 'selected' | 'uploading' | 'done';
+
+const MAX_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function defaultUploadTitle(filename: string): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  // 去掉副檔名
+  const base = filename.replace(/\.[^.]+$/, '');
+  return `上傳音檔 ${stamp} ${base}`.trim();
+}
 
 function defaultTitle(): string {
   const d = new Date();
@@ -55,6 +73,14 @@ export default function RecordPage() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startedAtRef = useRef<number>(0);
   const mimeTypeRef = useRef<string | undefined>(undefined);
+
+  // 上傳音檔相關 state
+  const [uploadPhase, setUploadPhase] = useState<UploadPhase>('idle');
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadTitle, setUploadTitle] = useState('');
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadMeetId, setUploadMeetId] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 清乾淨所有錄音相關資源（停止 stream / 取消 raf / 關 audio context）
   function cleanup() {
@@ -241,6 +267,91 @@ export default function RecordPage() {
     setResultMeetId(null);
   }
 
+  function onUploadFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    setUploadError(null);
+    const file = e.target.files?.[0];
+    // reset input value 讓使用者可以重選同一個檔案
+    if (e.target) e.target.value = '';
+    if (!file) return;
+
+    if (file.size > MAX_UPLOAD_SIZE) {
+      setUploadError(
+        `檔案太大（${formatFileSize(file.size)}），上限 100MB`,
+      );
+      return;
+    }
+    if (file.size === 0) {
+      setUploadError('檔案是空的');
+      return;
+    }
+
+    setUploadFile(file);
+    setUploadTitle(defaultUploadTitle(file.name));
+    setUploadPhase('selected');
+  }
+
+  function clearUploadSelection() {
+    setUploadFile(null);
+    setUploadTitle('');
+    setUploadError(null);
+    setUploadPhase('idle');
+  }
+
+  async function submitUpload() {
+    if (!uploadFile) return;
+    setUploadError(null);
+    setUploadPhase('uploading');
+
+    try {
+      const form = new FormData();
+      form.append('audio', uploadFile, uploadFile.name);
+      form.append('title', uploadTitle || defaultUploadTitle(uploadFile.name));
+
+      const res = await fetch('/api/recordings', {
+        method: 'POST',
+        credentials: 'include',
+        body: form,
+      });
+
+      const text = await res.text();
+      let parsed: unknown = null;
+      if (text.length > 0) {
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = text;
+        }
+      }
+
+      if (!res.ok) {
+        const msg =
+          parsed && typeof parsed === 'object' && 'error' in parsed
+            ? String((parsed as { error: unknown }).error)
+            : `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+
+      const meetId =
+        parsed && typeof parsed === 'object' && 'meet_id' in parsed
+          ? String((parsed as { meet_id: unknown }).meet_id)
+          : null;
+      setUploadMeetId(meetId);
+      setUploadPhase('done');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '上傳失敗';
+      setUploadError(`上傳失敗：${message}`);
+      setUploadPhase('selected');
+    }
+  }
+
+  function resetUploadForNext() {
+    setUploadFile(null);
+    setUploadTitle('');
+    setUploadError(null);
+    setUploadMeetId(null);
+    setUploadPhase('idle');
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -311,7 +422,7 @@ export default function RecordPage() {
             <div className="flex flex-col items-center gap-3 text-center">
               <div className="flex items-center gap-2 text-base font-medium text-emerald-700">
                 <CheckCircle2 className="h-6 w-6" />
-                已上傳，1-3 分鐘內 dashboard 會出現摘要
+                已上傳，speaches 正在轉錄。完成後 Dashboard 會出現摘要
               </div>
               {resultMeetId && (
                 <div className="text-xs text-slate-500">
@@ -337,6 +448,136 @@ export default function RecordPage() {
         </div>
       </div>
 
+      <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+        <div className="flex items-center gap-2 pb-3">
+          <Upload className="h-5 w-5 text-blue-600" />
+          <h2 className="text-lg font-semibold text-slate-800">上傳音檔</h2>
+        </div>
+        <p className="pb-4 text-sm text-slate-500">
+          已有錄好的音檔？直接上傳由 speaches 處理（支援 webm / m4a / mp3 / wav / ogg，上限 100MB）
+        </p>
+
+        {uploadError && (
+          <div className="mb-4">
+            <ErrorBanner error={uploadError} />
+          </div>
+        )}
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="audio/*"
+          hidden
+          onChange={onUploadFileSelected}
+        />
+
+        {uploadPhase === 'idle' && (
+          <div className="flex flex-col items-center justify-center gap-3 border-t border-slate-100 pt-6">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-2 rounded-full bg-blue-600 px-8 py-4 text-base font-semibold text-white shadow-md transition hover:bg-blue-700"
+            >
+              <Upload className="h-5 w-5" />
+              📤 選擇音檔
+            </button>
+            <p className="text-xs text-slate-500">支援格式：audio/* （webm、m4a、mp3、wav、ogg）</p>
+          </div>
+        )}
+
+        {uploadPhase === 'selected' && uploadFile && (
+          <div className="space-y-4 border-t border-slate-100 pt-6">
+            <div className="flex items-start gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+              <FileAudio className="mt-0.5 h-5 w-5 flex-shrink-0 text-blue-600" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium text-slate-800">
+                  {uploadFile.name}
+                </div>
+                <div className="text-xs text-slate-500">
+                  {formatFileSize(uploadFile.size)}
+                  {uploadFile.type ? ` · ${uploadFile.type}` : ''}
+                </div>
+              </div>
+              <button
+                onClick={clearUploadSelection}
+                className="text-xs text-slate-500 hover:text-slate-700"
+              >
+                取消
+              </button>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-sm font-medium text-slate-700">會議標題</label>
+              <input
+                type="text"
+                value={uploadTitle}
+                onChange={(e) => setUploadTitle(e.target.value)}
+                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-blue-400 focus:outline-none"
+                placeholder="例：5/18 產品提案討論"
+              />
+            </div>
+
+            <div className="flex justify-center gap-3 pt-2">
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+              >
+                重選檔案
+              </button>
+              <button
+                onClick={submitUpload}
+                className="flex items-center gap-2 rounded-md bg-blue-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
+              >
+                <Upload className="h-4 w-4" />
+                上傳
+              </button>
+            </div>
+          </div>
+        )}
+
+        {uploadPhase === 'uploading' && (
+          <div className="flex flex-col items-center justify-center gap-2 border-t border-slate-100 pt-6 text-sm text-slate-600">
+            <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+            <span>上傳中…</span>
+            {uploadFile && (
+              <span className="text-xs text-slate-500">
+                {uploadFile.name} ({formatFileSize(uploadFile.size)})
+              </span>
+            )}
+          </div>
+        )}
+
+        {uploadPhase === 'done' && (
+          <div className="flex flex-col items-center gap-3 border-t border-slate-100 pt-6 text-center">
+            <div className="flex items-center gap-2 text-base font-medium text-emerald-700">
+              <CheckCircle2 className="h-6 w-6" />
+              已上傳，speaches 正在轉錄中
+            </div>
+            <p className="text-xs text-slate-500">
+              完成後 Dashboard 會顯示摘要，並透過 Telegram 通知。
+            </p>
+            {uploadMeetId && (
+              <div className="text-xs text-slate-500">
+                Meet ID: <span className="font-mono">{uploadMeetId}</span>
+              </div>
+            )}
+            <div className="flex gap-3 pt-2">
+              <Link
+                to="/"
+                className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+              >
+                返回會議列表
+              </Link>
+              <button
+                onClick={resetUploadForNext}
+                className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+              >
+                再上傳一個
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
       <div className="rounded-md border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
         <p className="font-medium text-slate-700">使用說明</p>
         <ul className="mt-1 list-disc space-y-0.5 pl-5">
@@ -344,6 +585,7 @@ export default function RecordPage() {
           <li>建議在安靜環境錄音，背景噪音會降低轉錄品質</li>
           <li>停止後音檔會自動上傳，後端用 speaches (faster-whisper) 轉錄為中文</li>
           <li>轉錄完成後會自動產生摘要、Action Items，並寫入會議列表</li>
+          <li>沒有麥克風或要測試既有音檔，可用「📤 上傳音檔」直接送檔案進管線</li>
         </ul>
       </div>
     </div>

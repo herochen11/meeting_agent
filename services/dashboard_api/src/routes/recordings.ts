@@ -141,6 +141,6 @@ recordingsRoute.post("/api/recordings", async (c) => {
   return c.json({
     success: true,
     meet_id: meetId,
-    message: "錄音已收到，處理中（約 1-3 分鐘）",
+    message: "錄音已收到，speaches 正在轉錄中（時長越長等越久，完成會通知）",
   });
 });

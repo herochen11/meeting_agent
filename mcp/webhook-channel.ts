@@ -502,20 +502,19 @@ Bun.serve({
           `⚠️ 請用 Agent tool 生成 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
           ``,
           `Sub-agent 執行步驟：`,
-          `1. 用 mcp__plugin_telegram_telegram__reply(chat_id=1064895221, "⏳ 處理本地錄音中...") 發送處理中提示給 Brian，記下回傳的 message_id`,
-          `2. 用新版議題式 prompt 從附帶的逐字稿產生摘要 + Action Items（MMDD_N 編號）`,
-          `3. UPSERT nb_meetings（依 meet_id 查自己的 row）：`,
+          `1. 用新版議題式 prompt 從附帶的逐字稿產生摘要 + Action Items（MMDD_N 編號）`,
+          `2. UPSERT nb_meetings（依 meet_id 查自己的 row）：`,
           `   SELECT id, department_id FROM nb_meetings`,
-          `   WHERE meet_id='${meetId}' AND status IN ('會議進行中','逐字稿處理中')`,
+          `   WHERE meet_id='${meetId}' AND status IN ('等待加入','會議進行中','逐字稿處理中')`,
           `   ORDER BY id DESC LIMIT 1;`,
           `   - 找到 → UPDATE SET status='completed', title=正式標題, summary=議題式摘要,`,
           `     end_time=NOW(), duration_minutes=${duration ? Math.round(duration / 60) : "null"},`,
           `     transcript_md_path=...（記得保留 source='local-recording'）`,
           `     ❗ 不要動 department_id，建立時寫入的就是正確的`,
           `   - 沒找到 → INSERT 新 row（兼容歷史 / 手動加入）`,
-          `4. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${meetId}.md`,
+          `3. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${meetId}.md`,
           `   - 含 metadata、議題式摘要、Action Items、完整逐字稿`,
-          `5. 自動更新既有 Action Items（依本場會議內容判斷）`,
+          `4. 自動更新既有 Action Items（依本場會議內容判斷）`,
           ``,
           `   - 查出本部門所有「未開始 / 進行中」的 Action Items：`,
           `     SELECT code, description, assignee, status, due_date, notes`,
@@ -541,10 +540,9 @@ Bun.serve({
           `     SET <欄位> = <新值>, updated_at = NOW()`,
           `     WHERE code = '<MMDD_N>' AND department_id = ${deptId ?? "<dept_id>"};`,
           ``,
-          `   - 記下「本次自動更新了哪些 AI、改了什麼、為什麼」，在步驟 8 的最終摘要訊息中一起回報。`,
-          `6. 用 append_action_items(dept="<部門名稱>" 或 chat_id="<群組 chat_id>", items=[...]) 寫入 nb_action_items DB`,
-          `7. 用 mcp__plugin_telegram_telegram__edit_message(chat_id=1064895221, message_id, "✅ 處理完成") 更新處理中訊息`,
-          `8. 用 mcp__plugin_telegram_telegram__reply 發新訊息 DM Brian (chat_id=1064895221) 帶完整摘要 + Dashboard 連結（觸發推撥）`,
+          `   - 記下「本次自動更新了哪些 AI、改了什麼、為什麼」，在最終摘要訊息中一起回報。`,
+          `5. 用 append_action_items(dept="<部門名稱>" 或 chat_id="<群組 chat_id>", items=[...]) 寫入 nb_action_items DB`,
+          `6. 用 mcp__plugin_telegram_telegram__reply 發新訊息 DM Brian (chat_id=1064895221) 帶完整摘要 + Dashboard 連結（觸發推撥）`,
           `   ⚠️ 本地錄音不走 TG 群組，只 DM Brian`,
           `   - 若步驟 5 有自動更新既有 AI，在摘要訊息中加入下列區塊（0 項就不顯示）：`,
           `     🔄 本場會議自動更新了 N 項既有 Action Items：`,
@@ -564,7 +562,7 @@ Bun.serve({
               meet_id: meetId,
               dept_id: String(deptId ?? ""),
               title: title,
-              duration: duration ?? null,
+              duration: String(duration ?? ""),
             },
           },
         });
@@ -620,14 +618,15 @@ Bun.serve({
         }
         recentMeetings.set(dedupeKey, now);
 
-        // 立刻把 nb_meetings 占位 row 的 status 從「會議進行中」改為「逐字稿處理中」
+        // 立刻把 nb_meetings 占位 row 的 status 從「等待加入 / 會議進行中」改為「逐字稿處理中」
         // 讓 Dashboard 在 sub-agent 還沒跑完前能顯示更精確的狀態
+        // 接受「等待加入」是因為會議可能在 bot 還沒被 admit 就結束（host 取消、未開啟等）
         if (nativeMeetingId) {
           try {
             const updated = await sql`
               UPDATE nb_meetings
               SET status = '逐字稿處理中'
-              WHERE meet_id = ${nativeMeetingId} AND status = '會議進行中'
+              WHERE meet_id = ${nativeMeetingId} AND status IN ('等待加入', '會議進行中')
               RETURNING id
             `;
             log(`Status transition: meet_id=${nativeMeetingId} → 逐字稿處理中 (rows=${updated.length})`);
@@ -649,7 +648,7 @@ Bun.serve({
         // Option B：channel 訊息只露出 meet_id（Google Meet code），不暴露任何 numeric ID
         // Sub-agent 內部需要 numeric ID 時自己查 DB：
         //   - Vexa 內部 id：SELECT id FROM meetings WHERE platform_specific_id=? ORDER BY id DESC LIMIT 1
-        //   - nb_meetings.id：SELECT id FROM nb_meetings WHERE meet_id=? AND status IN ('會議進行中','逐字稿處理中') ORDER BY id DESC LIMIT 1
+        //   - nb_meetings.id：SELECT id FROM nb_meetings WHERE meet_id=? AND status IN ('等待加入','會議進行中','逐字稿處理中') ORDER BY id DESC LIMIT 1
         const content = [
           `🔔 會議結束通知`,
           ``,
@@ -666,21 +665,20 @@ Bun.serve({
           `⚠️ 請用 Agent tool 生成 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
           ``,
           `Sub-agent 執行步驟：`,
-          `1. 用 mcp__plugin_telegram_telegram__reply(chat_id=${deptInfo.chatId || "<部門 chat_id>"}, "⏳ 處理中...") 發送處理中提示，記下回傳的 message_id`,
-          `2. 查 Vexa 內部 meeting id（summarize_meeting 需要 numeric id）：`,
+          `1. 查 Vexa 內部 meeting id（summarize_meeting 需要 numeric id）：`,
           `   docker exec vexa-postgres-1 psql -U postgres -d vexa -tAc "\\`,
           `     SELECT id FROM meetings WHERE platform_specific_id='${nativeMeetingId}' ORDER BY id DESC LIMIT 1;"`,
           `   然後呼叫 mcp__vexa__summarize_meeting(meeting_id=<查到的 id>) 取得逐字稿`,
-          `3. 用新版議題式 prompt 產生摘要和 Action Items（MMDD_N 編號）`,
-          `4. UPSERT nb_meetings（依 meet_id 查自己的 row）：`,
+          `2. 用新版議題式 prompt 產生摘要和 Action Items（MMDD_N 編號）`,
+          `3. UPSERT nb_meetings（依 meet_id 查自己的 row）：`,
           `   SELECT id, department_id FROM nb_meetings`,
-          `   WHERE meet_id='${nativeMeetingId}' AND status IN ('會議進行中','逐字稿處理中')`,
+          `   WHERE meet_id='${nativeMeetingId}' AND status IN ('等待加入','會議進行中','逐字稿處理中')`,
           `   ORDER BY id DESC LIMIT 1;`,
           `   - 找到 → UPDATE SET title=正式標題, status='completed', end_time=NOW(),`,
           `     summary=議題式摘要, transcript_md_path=...`,
           `     ❗ 不要動 department_id，派發時寫入的就是正確的`,
           `   - 沒找到 → INSERT 新 row（兼容歷史 / 手動加入），department_id 依 chat_id 查 nb_departments`,
-          `5. 自動更新既有 Action Items（依本場會議內容判斷）`,
+          `4. 自動更新既有 Action Items（依本場會議內容判斷）`,
           ``,
           `   - 查出本部門所有「未開始 / 進行中」的 Action Items：`,
           `     SELECT code, description, assignee, status, due_date, notes`,
@@ -706,14 +704,13 @@ Bun.serve({
           `     SET <欄位> = <新值>, updated_at = NOW()`,
           `     WHERE code = '<MMDD_N>' AND department_id = ${deptInfo.deptId || "<dept_id>"};`,
           ``,
-          `   - 記下「本次自動更新了哪些 AI、改了什麼、為什麼」，在步驟 9 的最終摘要訊息中一起回報給群組。`,
-          `6. 用 append_action_items(chat_id="${deptInfo.chatId || "<部門 chat_id>"}", items=[...]) 寫入 nb_action_items DB`,
-          `7. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${nativeMeetingId}.md`,
+          `   - 記下「本次自動更新了哪些 AI、改了什麼、為什麼」，在最終摘要訊息中一起回報。`,
+          `5. 用 append_action_items(chat_id="${deptInfo.chatId || "<部門 chat_id>"}", items=[...]) 寫入 nb_action_items DB`,
+          `6. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${nativeMeetingId}.md`,
           `   （含 metadata、議題式摘要、Action Items、完整逐字稿；自動更新 nb_meetings.summary + transcript_md_path）`,
-          `8. 用 mcp__plugin_telegram_telegram__edit_message(chat_id, message_id, "✅ 處理完成") 更新處理中訊息`,
-          `9. 用 mcp__plugin_telegram_telegram__reply 發新訊息帶完整摘要 + Excel 附件（觸發推撥）`,
+          `7. 用 mcp__plugin_telegram_telegram__reply 發完整摘要 + Excel 附件到 dept 群組（觸發推撥）`,
           `   - Excel 從 dashboard_api /api/action-items/export.xlsx 下載`,
-          `   - 若步驟 5 有自動更新既有 AI，在摘要訊息中加入下列區塊（0 項就不顯示）：`,
+          `   - 若步驟 4 有自動更新既有 AI，在摘要訊息中加入下列區塊（0 項就不顯示）：`,
           `     🔄 本場會議自動更新了 N 項既有 Action Items：`,
           `     • <code> 「<desc 前 15 字>」 — <欄位>: <舊值> → <新值>（依據：<簡短原因>）`,
           `     • ...`,

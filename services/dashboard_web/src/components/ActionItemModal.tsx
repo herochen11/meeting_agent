@@ -75,7 +75,10 @@ export default function ActionItemModal({ mode, onClose }: Props) {
       return api.post<ActionItem>('/api/action-items', payload);
     },
     onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ['action-items'] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['action-items'] }),
+        qc.invalidateQueries({ queryKey: ['overview', 'action-items'] }),
+      ]);
       onClose();
     },
     onError: (err: unknown) => {

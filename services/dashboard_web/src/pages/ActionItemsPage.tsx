@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Download, Eye, EyeOff, Loader2, Pencil, Plus } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { Download, Eye, EyeOff, Loader2, Pencil, Plus, X } from 'lucide-react';
 
 import ActionItemModal, { type ActionItemModalMode } from '../components/ActionItemModal';
 import ErrorBanner from '../components/ErrorBanner';
@@ -9,7 +10,42 @@ import { api, type ActionItem } from '../lib/api';
 
 type Status = '未開始' | '進行中' | '已完成';
 const STATUSES: Status[] = ['未開始', '進行中', '已完成'];
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_COMPLETED_DEFAULT = 10;
+
+type ReminderFilter = 'overdue' | 'due-soon' | null;
+
+const FILTER_LABEL: Record<Exclude<ReminderFilter, null>, string> = {
+  overdue: '只顯示已逾期（截止日已過且未完成）',
+  'due-soon': '只顯示明天到期（未完成）',
+};
+
+function startOfToday(): Date {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function parseDueDate(s: string | null): Date | null {
+  if (!s) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!match) return null;
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 0, 0, 0, 0);
+}
+
+function passesReminderFilter(it: ActionItem, filter: ReminderFilter): boolean {
+  if (!filter) return true;
+  if (it.status === '已完成') return false;
+  const due = parseDueDate(it.due_date);
+  if (!due) return false;
+  const today = startOfToday();
+  if (filter === 'overdue') return due.getTime() < today.getTime();
+  if (filter === 'due-soon') {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return due.getTime() === tomorrow.getTime();
+  }
+  return true;
+}
 
 const ownerColors = [
   'bg-blue-100 text-blue-700',
@@ -38,15 +74,12 @@ function groupByOwner(items: ActionItem[]): Map<string, ActionItem[]> {
   return m;
 }
 
-/** 已完成項目的 7 天保留判定。
- * 規則：以 due_date 為準；若 NULL 則 fallback updated_at；兩者皆 NULL 一律保留。 */
-function isCompletedWithinWindow(it: ActionItem, threshold: Date): boolean {
-  if (it.status !== '已完成') return true;
-  const refStr = it.due_date ?? it.updated_at ?? null;
-  if (!refStr) return true;
-  const ref = new Date(refStr);
-  if (Number.isNaN(ref.getTime())) return true;
-  return ref >= threshold;
+/** 已完成項目排序鍵：updated_at 優先，fallback due_date；越新越前面。 */
+function completedSortKey(it: ActionItem): number {
+  const refStr = it.updated_at ?? it.due_date ?? null;
+  if (!refStr) return 0;
+  const t = new Date(refStr).getTime();
+  return Number.isNaN(t) ? 0 : t;
 }
 
 function StatusDropdown({
@@ -124,10 +157,10 @@ function StatusColumn({
             onClick={onToggleShowAll}
             title={
               showAllCompleted
-                ? '收起：只顯示近 7 天的已完成'
+                ? '收起：只顯示最近 10 個已完成'
                 : (hiddenCompletedCount ?? 0) > 0
-                  ? `已隱藏 ${hiddenCompletedCount} 個（超過 7 天）`
-                  : '目前沒有超過 7 天的已完成項目'
+                  ? `已隱藏 ${hiddenCompletedCount} 個（預設顯示最近 10 個）`
+                  : '已完成項目少於 10 個，全部已顯示'
             }
             className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition ${
               showAllCompleted
@@ -207,11 +240,33 @@ export default function ActionItemsPage() {
   const [modal, setModal] = useState<ActionItemModalMode | null>(null);
   const [showAllCompleted, setShowAllCompleted] = useState(false);
 
+  // 從 ?filter=overdue / ?filter=due-soon 一次性 preset 篩選
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [reminderFilter, setReminderFilter] = useState<ReminderFilter>(null);
+  useEffect(() => {
+    const raw = searchParams.get('filter');
+    if (raw === 'overdue' || raw === 'due-soon') {
+      setReminderFilter(raw);
+    }
+    // 一次性：讀完就清掉 query string，後續使用者操作不再受影響
+    if (raw) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('filter');
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function clearReminderFilter() {
+    setReminderFilter(null);
+  }
+
   const statusMutation = useMutation({
     mutationFn: ({ id, status }: { id: number; status: Status }) =>
       api.patch<ActionItem>(`/api/action-items/${id}`, { status }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['action-items'] });
+      queryClient.invalidateQueries({ queryKey: ['overview', 'action-items'] });
     },
   });
 
@@ -228,26 +283,29 @@ export default function ActionItemsPage() {
     statusMutation.mutate({ id: it.id, status });
   }
 
-  // 完整分組（未經 7 天 filter）
+  // 完整分組（未經 7 天 filter，但已套用 reminderFilter）
   const byStatusAll = useMemo(() => {
     const m: Record<Status, ActionItem[]> = { 未開始: [], 進行中: [], 已完成: [] };
     if (data) {
       for (const it of data) {
+        if (!passesReminderFilter(it, reminderFilter)) continue;
         if (m[it.status as Status]) m[it.status as Status].push(it);
       }
     }
     return m;
-  }, [data]);
+  }, [data, reminderFilter]);
 
-  // 套用 7 天 filter 後的分組（用於畫面顯示）
+  // 限制「已完成」預設只顯示最近 10 個（依 updated_at / due_date 排序），可展開
   const byStatus = useMemo(() => {
-    const threshold = new Date(Date.now() - SEVEN_DAYS_MS);
+    const completedSorted = [...byStatusAll.已完成].sort(
+      (a, b) => completedSortKey(b) - completedSortKey(a),
+    );
     const result: Record<Status, ActionItem[]> = {
       未開始: byStatusAll.未開始,
       進行中: byStatusAll.進行中,
       已完成: showAllCompleted
-        ? byStatusAll.已完成
-        : byStatusAll.已完成.filter((it) => isCompletedWithinWindow(it, threshold)),
+        ? completedSorted
+        : completedSorted.slice(0, MAX_COMPLETED_DEFAULT),
     };
     return result;
   }, [byStatusAll, showAllCompleted]);
@@ -261,7 +319,7 @@ export default function ActionItemsPage() {
         <div>
           <h1 className="text-2xl font-semibold text-slate-800">Action Items</h1>
           <p className="text-sm text-slate-500">
-            按狀態分三欄，欄內依負責人 group。卡片底部 dropdown 切換狀態，點 ✎ 編輯其他欄位。已完成超過 7 天的項目預設隱藏，可在「已完成」欄展開。
+            按狀態分三欄，欄內依負責人 group。卡片底部 dropdown 切換狀態，點 ✎ 編輯其他欄位。已完成預設只顯示最近 10 個，可在「已完成」欄展開查看全部。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -282,6 +340,20 @@ export default function ActionItemsPage() {
           </button>
         </div>
       </div>
+
+      {reminderFilter && (
+        <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span>篩選中：{FILTER_LABEL[reminderFilter]}</span>
+          <button
+            onClick={clearReminderFilter}
+            className="ml-auto inline-flex items-center gap-1 rounded border border-amber-300 bg-white px-2 py-0.5 text-amber-700 hover:bg-amber-100"
+            title="清除篩選"
+          >
+            <X className="h-3 w-3" />
+            清除篩選
+          </button>
+        </div>
+      )}
 
       {isLoading && <LoadingSpinner />}
       {error && <ErrorBanner error={error} />}

@@ -8,6 +8,7 @@ import CalendarPage from './pages/CalendarPage';
 import LoginPage from './pages/LoginPage';
 import MeetingDetailPage from './pages/MeetingDetailPage';
 import MeetingsListPage from './pages/MeetingsListPage';
+import OverviewPage from './pages/OverviewPage';
 import RecordPage from './pages/RecordPage';
 import ReportDetailPage from './pages/ReportDetailPage';
 import ReportsListPage from './pages/ReportsListPage';
@@ -37,7 +38,8 @@ export default function App() {
           </RequireDept>
         }
       >
-        <Route path="/" element={<MeetingsListPage />} />
+        <Route path="/" element={<OverviewPage />} />
+        <Route path="/meetings" element={<MeetingsListPage />} />
         <Route path="/meetings/:id" element={<MeetingDetailPage />} />
         <Route path="/action-items" element={<ActionItemsPage />} />
         <Route path="/record" element={<RecordPage />} />

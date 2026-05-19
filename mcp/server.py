@@ -535,7 +535,9 @@ async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsB
                 mapping[meet_id] = str(chat_id)
                 _write_meeting_map(mapping)
 
-                # INSERT 占位 row 到 nb_meetings（會議進行中），讓 Dashboard 立刻顯示
+                # INSERT 占位 row 到 nb_meetings（等待加入），讓 Dashboard 立刻顯示
+                # 等待加入 = bot 已派發但尚未實際加入會議（host 還沒 admit / Vexa 容器啟動中）
+                # /api/bot/status 偵測到 meet_id 出現在 Vexa running_bots 後會自動轉成「會議進行中」
                 # 失敗只 log warning，不擋 join_meeting 本身成功
                 try:
                     with _db_conn() as conn:
@@ -553,10 +555,10 @@ async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsB
                                     INSERT INTO nb_meetings
                                       (department_id, vexa_meeting_id, title, meet_id,
                                        platform, status, start_time)
-                                    SELECT %s, %s, '待定', %s, 'Google Meet', '會議進行中', NOW()
+                                    SELECT %s, %s, '待定', %s, 'Google Meet', '等待加入', NOW()
                                     WHERE NOT EXISTS (
                                         SELECT 1 FROM nb_meetings
-                                        WHERE meet_id = %s AND status = '會議進行中'
+                                        WHERE meet_id = %s AND status IN ('等待加入', '會議進行中')
                                     )
                                     """,
                                     (dept_id, mid, meet_id, meet_id),

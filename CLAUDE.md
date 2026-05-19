@@ -258,6 +258,26 @@ NoirsBoxes {部門名稱} — YYYY 年 M 月會議報告
 
 ## 自動觸發規則
 
+### Bot 狀態流（nb_meetings.status）
+
+```
+派發 bot
+  ↓ status = '等待加入'             ← bot 已派發但尚未實際加入會議
+  ↓                                  （host 還沒 admit / Vexa 容器啟動中）
+  ↓ /api/bot/status 偵測到 meet_id 出現在 Vexa running_bots
+  ↓ → 自動 UPDATE 為 '會議進行中'
+  ↓ meeting.completed webhook
+  ↓ → '逐字稿處理中'                 （等待加入 / 會議進行中 都可轉場）
+  ↓ sub-agent 完成
+  ↓ → 'completed'
+```
+
+說明：
+- `等待加入` 是新增狀態（2026-05-19 之後），目的是區分「已派發 bot」與「bot 真的加入會議」
+- Dashboard 上「等待加入」會用黃色 badge 顯示，「進行中」用綠色
+- BotConsole 對「等待加入」rows disable「停止 bot」按鈕（Vexa 容器還沒起，stop 沒意義）
+- 凡是處理舊資料 / 舊占位 row 的查詢，請用 `status IN ('等待加入', '會議進行中', '逐字稿處理中')` 涵蓋所有可能
+
 ### 派發 bot 時自動 Recap
 
 每次 `join_meeting` 成功派發 bot（不論透過 mcp tool 還是 dashboard）後，**會自動發一則 recap 到該部門 TG 群組**，包含：
@@ -285,8 +305,10 @@ NoirsBoxes {部門名稱} — YYYY 年 M 月會議報告
 1. 呼叫 `summarize_meeting` 取得逐字稿
 2. 產生摘要和 Action Items（含 MMDD_N 編號，按新版議題式 prompt 格式）
 3. UPSERT 到 `nb_meetings`：
-   - 先查是否已有同 meet_id 且 status IN ('會議進行中', '逐字稿處理中') 的占位 row
-     - 派發 bot 時建立 `會議進行中`，webhook 進來時 webhook-channel.ts 會自動改成 `逐字稿處理中`
+   - 先查是否已有同 meet_id 且 status IN ('等待加入', '會議進行中', '逐字稿處理中') 的占位 row
+     - 派發 bot 時建立 `等待加入`（bot 尚未實際加入）
+     - `/api/bot/status` 偵測到 meet_id 出現在 Vexa running_bots 後自動改為 `會議進行中`
+     - webhook 進來時 webhook-channel.ts 會自動把 `等待加入 / 會議進行中` 改成 `逐字稿處理中`
    - 有 → UPDATE 該 row（title 改為議題式摘要的第一個議題或自動產生標題、status='completed'、end_time、summary、participants、transcript_md_path 等）
      - ❗ **不要動 `department_id`** — 派發時寫入的就是正確的部門歸屬
    - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程），`department_id` 依 chat_id 查 `nb_departments`，**不要查 meeting_map.json**
@@ -573,7 +595,7 @@ dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 bot 時寫�
 2. 呼叫 summarize_meeting(meeting_id=7) 取得逐字稿
 3. 產生摘要和 Action Items
 4. UPSERT 到 nb_meetings：
-   - 先 SELECT 同 meet_id 且 status='會議進行中' 的占位 row（派發 bot 時建立）
+   - 先 SELECT 同 meet_id 且 status IN ('等待加入', '會議進行中', '逐字稿處理中') 的占位 row（派發 bot 時建立）
    - 有 → UPDATE 該 row（title=正式標題, status='completed', end_time=NOW(),
      summary=..., participants=..., transcript_md_path=...）
      ❗ 不要動 department_id，派發時寫入的就是正確的

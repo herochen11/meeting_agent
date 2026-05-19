@@ -55,50 +55,130 @@ interface VexaStatusResponse {
   [key: string]: unknown;
 }
 
+interface BotStatusEntry {
+  meet_id: string;
+  status: "等待加入" | "進行中" | "逐字稿處理中";
+  vexa_meeting_id: number | null;
+  started_at: string | null;
+  source: "vexa-bot" | "local-recording";
+  title: string | null;
+}
+
 botRoute.get("/api/bot/status", async (c) => {
   if (!VEXA_KEY) {
     return c.json({ error: "伺服器未設定 VEXA_USER_API_KEY" }, 500);
   }
 
   const deptId = getDeptId(c);
-  const chatId = await getDeptChatId(deptId);
-  if (!chatId) {
-    return c.json({ error: "本部門未設定 chat_id" }, 400);
-  }
 
-  let res: Response;
+  // 1. 撈 Vexa running_bots（交叉比對 + 偵測 bot 是否已加入）
+  //    Vexa 不通也不擋；此時所有等待加入的 row 維持等待加入即可
+  let runningMeetIds = new Set<string>();
+  let vexaUnavailable = false;
   try {
-    res = await fetch(`${VEXA_BASE}/bots/status`, {
+    const res = await fetch(`${VEXA_BASE}/bots/status`, {
       headers: { "X-API-Key": VEXA_KEY },
     });
-  } catch (err) {
-    return c.json(
-      { error: `無法連線到 Vexa API：${(err as Error).message}` },
-      502,
-    );
+    if (res.ok) {
+      const data = (await res.json().catch(() => ({}))) as VexaStatusResponse;
+      const allBots = Array.isArray(data.running_bots) ? data.running_bots : [];
+      for (const b of allBots) {
+        if (typeof b.native_meeting_id === "string" && b.native_meeting_id) {
+          runningMeetIds.add(b.native_meeting_id);
+        }
+      }
+    } else {
+      vexaUnavailable = true;
+    }
+  } catch {
+    vexaUnavailable = true;
   }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    return c.json(
-      { error: `Vexa API 回應錯誤 (${res.status})`, detail: text.slice(0, 500) },
-      502,
-    );
+  // 2. 撈 nb_meetings：本部門所有「進行中 / 等待中 / 處理中」的 row
+  //    部門隔離以 department_id 為準，不再讀 meeting_map.json
+  //    包含 source='local-recording' — 本地錄音也算「處理中」，前端會用 mic icon 區分顯示
+  const rows = await sql<
+    {
+      meet_id: string;
+      vexa_meeting_id: number | null;
+      status: string;
+      start_time: string | null;
+      source: string | null;
+      title: string | null;
+    }[]
+  >`
+    SELECT meet_id, vexa_meeting_id, status, start_time,
+           COALESCE(source, 'vexa-bot') AS source, title
+    FROM nb_meetings
+    WHERE department_id = ${deptId}
+      AND status IN ('等待加入', '會議進行中', '逐字稿處理中')
+    ORDER BY start_time DESC NULLS LAST, id DESC
+  `;
+
+  // 3. 自動轉場：'等待加入' 且 meet_id 出現在 Vexa running_bots → 改為 '會議進行中'
+  const toPromote: string[] = [];
+  for (const r of rows) {
+    if (r.status === "等待加入" && runningMeetIds.has(r.meet_id)) {
+      toPromote.push(r.meet_id);
+    }
+  }
+  if (toPromote.length > 0) {
+    try {
+      await sql`
+        UPDATE nb_meetings
+        SET status = '會議進行中'
+        WHERE department_id = ${deptId}
+          AND status = '等待加入'
+          AND meet_id = ANY(${toPromote})
+      `;
+    } catch (err) {
+      console.warn(
+        `等待加入 → 會議進行中 自動轉場失敗：${(err as Error).message}`,
+      );
+    }
   }
 
-  const data = (await res.json().catch(() => ({}))) as VexaStatusResponse;
-  const allBots = Array.isArray(data.running_bots) ? data.running_bots : [];
+  // 4. 整理回應：把 DB status 對應到顯示用 status
+  //    - 等待加入 → 等待加入
+  //    - 會議進行中 → 進行中（不論 Vexa 是否還列出該 bot，DB 為主）
+  //    - 逐字稿處理中 → 逐字稿處理中
+  const bots: BotStatusEntry[] = rows.map((r) => {
+    let displayStatus: BotStatusEntry["status"];
+    if (r.status === "等待加入") {
+      // 若剛轉場到「會議進行中」，回應也順手反映
+      displayStatus = runningMeetIds.has(r.meet_id) ? "進行中" : "等待加入";
+    } else if (r.status === "會議進行中") {
+      displayStatus = "進行中";
+    } else {
+      displayStatus = "逐字稿處理中";
+    }
+    const source: BotStatusEntry["source"] =
+      r.source === "local-recording" ? "local-recording" : "vexa-bot";
+    // 本地錄音不會出現在 Vexa running_bots，displayStatus 強制標為「逐字稿處理中」
+    const finalStatus: BotStatusEntry["status"] =
+      source === "local-recording" ? "逐字稿處理中" : displayStatus;
+    return {
+      meet_id: r.meet_id,
+      status: finalStatus,
+      vexa_meeting_id: r.vexa_meeting_id,
+      started_at: r.start_time,
+      source,
+      title: r.title,
+    };
+  });
 
-  const map = await readMeetingMap();
-  // 過濾本部門 + 把 native_meeting_id alias 成 meet_id（前端用 meet_id）
-  const filtered = allBots
-    .map((b) => {
-      const meetId = typeof b.native_meeting_id === "string" ? b.native_meeting_id : null;
-      return { ...b, meet_id: meetId };
-    })
-    .filter((b) => b.meet_id != null && map[b.meet_id] === chatId);
-
-  return c.json({ count: filtered.length, bots: filtered });
+  const response: {
+    count: number;
+    bots: BotStatusEntry[];
+    warning?: string;
+  } = {
+    count: bots.length,
+    bots,
+  };
+  if (vexaUnavailable) {
+    response.warning = "Vexa API 暫時無法連線，狀態以 DB 為準";
+  }
+  return c.json(response);
 });
 
 interface JoinBody {
@@ -185,17 +265,19 @@ botRoute.post("/api/bot/join", async (c) => {
     mapWarning = `meeting_map.json 寫入失敗：${(err as Error).message}`;
   }
 
-  // INSERT 占位 row 到 nb_meetings（會議進行中），讓 Dashboard 立刻顯示
+  // INSERT 占位 row 到 nb_meetings（等待加入），讓 Dashboard 立刻顯示
+  // 等待加入 = bot 已派發但尚未實際加入會議（host 還沒 admit / Vexa 容器啟動中）
+  // /api/bot/status 偵測到 meet_id 出現在 Vexa running_bots 後會自動轉成「會議進行中」
   // 失敗只 log warning，不擋整個 API 成功
   let placeholderWarning: string | null = null;
   try {
     await sql`
       INSERT INTO nb_meetings
         (department_id, vexa_meeting_id, title, meet_id, platform, status, start_time)
-      SELECT ${deptId}, ${vexaMeetingId}, '待定', ${meetId}, 'Google Meet', '會議進行中', NOW()
+      SELECT ${deptId}, ${vexaMeetingId}, '待定', ${meetId}, 'Google Meet', '等待加入', NOW()
       WHERE NOT EXISTS (
         SELECT 1 FROM nb_meetings
-        WHERE meet_id = ${meetId} AND status = '會議進行中'
+        WHERE meet_id = ${meetId} AND status IN ('等待加入', '會議進行中')
       )
     `;
   } catch (err) {
