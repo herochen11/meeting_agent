@@ -253,6 +253,42 @@ cp config/departments.example.json config/departments.json
 
 部門資料會在系統運行時透過 TG 指令自動建立，初始保持空白即可。
 
+### Step 4.5：設定 Google Calendar OAuth（Dashboard 月曆 Tab 用）
+
+> ℹ️ 跟 Step 3 的 Service Account 是不同機制。**Service Account 在 2026-05-19 移除 Drive 流程後已不再被現有流程呼叫**（Step 3 可略過）。Calendar Tab 用「使用者級 OAuth」：每個使用者進 Dashboard 點「連結 Google 行事曆」自己同意授權，refresh_token 存到 dashboard_api DB。
+
+設定步驟（要 GCP Console 操作，約 10-15 分鐘）：
+
+1. 進 https://console.cloud.google.com/，建立新專案（命名隨意）
+2. **APIs & Services → Library** → 搜「Google Calendar API」→ Enable
+3. **APIs & Services → OAuth consent screen**（新版 UI 可能拆成 Branding / Audience / Data access / Clients 幾個 tab）：
+   - User Type / 使用者類型：選 **External**（gmail 帳號也能用；Workspace 可選 Internal 限網域內）
+   - Branding tab：填 App name、User support email、Developer contact information
+   - Data access / Scopes tab：加兩個 scope：
+     - `https://www.googleapis.com/auth/calendar.readonly`
+     - `https://www.googleapis.com/auth/calendar.events.readonly`
+   - Audience / Test users tab：把要連結的 Google email 全部加進去（Testing 模式最多 100 個）
+4. **APIs & Services → Credentials** → Create credentials → OAuth client ID：
+   - Application type: **Web application**（這個一定要選對，不然不會出現 redirect URI 欄位）
+   - Authorized redirect URIs: `http://localhost:8765/api/calendar/oauth-callback`
+   - Create 後跳出對話框 → 按「Download JSON」存檔
+5. 把 client_id + client_secret 寫進 `services/dashboard_api/.env`：
+   ```
+   GOOGLE_OAUTH_CLIENT_ID=<你的-client-id>.apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-<你的-client-secret>
+   GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8765/api/calendar/oauth-callback
+   ```
+
+⚠️ OAuth 模式選擇：
+
+| 模式 | 適用 | 限制 |
+|---|---|---|
+| **Testing**（預設、最簡單） | 開發 / 內部小團隊 | refresh token **7 天過期**；只有 Test users 名單能連結（最多 100 人） |
+| **In production（未驗證）** | 小型實際使用 | 上限 100 人；每個使用者首次授權看到「未驗證」警告（點「進階」→「繼續」即可）；refresh token 不會 7 天過期 |
+| **In production（已驗證）** | 公開上線 | 無人數限制、無警告 | 需向 Google 申請驗證（敏感 scope 通常 1-4 週審核） |
+
+公司內部用 Testing 或 In production（未驗證）都夠用。Testing 模式記得加 Test users，否則授權會失敗。
+
 ### Step 5：安裝依賴
 
 ```bash

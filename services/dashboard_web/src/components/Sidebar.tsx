@@ -1,6 +1,6 @@
 import { NavLink, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { CheckSquare, FileBarChart, LogOut, Mic, Settings, Video } from 'lucide-react';
+import { Calendar, CheckSquare, FileBarChart, LogOut, Mic, Settings, Video } from 'lucide-react';
 
 import { getStoredDept, logout } from '../lib/auth';
 import BotConsole from './BotConsole';
@@ -66,6 +66,10 @@ export default function Sidebar({ admin }: Props) {
             <NavLink to="/record" className={navItemClass}>
               <Mic className="h-4 w-4" />
               本地錄音
+            </NavLink>
+            <NavLink to="/calendar" className={navItemClass}>
+              <Calendar className="h-4 w-4" />
+              月曆
             </NavLink>
             <NavLink to="/reports" className={navItemClass}>
               <FileBarChart className="h-4 w-4" />

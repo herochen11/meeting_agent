@@ -8,6 +8,7 @@ import { botRoute } from "./routes/bot";
 import { adminRoute } from "./routes/admin";
 import { reportsRoute } from "./routes/reports";
 import { recordingsRoute } from "./routes/recordings";
+import { calendarRoute } from "./routes/calendar";
 
 const app = new Hono();
 
@@ -21,6 +22,7 @@ app.route("/", botRoute);
 app.route("/", adminRoute);
 app.route("/", reportsRoute);
 app.route("/", recordingsRoute);
+app.route("/", calendarRoute);
 
 app.notFound((c) => c.json({ error: "找不到此路徑" }, 404));
 

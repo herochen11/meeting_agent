@@ -4,6 +4,7 @@ import Layout from './components/Layout';
 import ActionItemsPage from './pages/ActionItemsPage';
 import AdminDepartmentsPage from './pages/AdminDepartmentsPage';
 import AdminLoginPage from './pages/AdminLoginPage';
+import CalendarPage from './pages/CalendarPage';
 import LoginPage from './pages/LoginPage';
 import MeetingDetailPage from './pages/MeetingDetailPage';
 import MeetingsListPage from './pages/MeetingsListPage';
@@ -40,6 +41,7 @@ export default function App() {
         <Route path="/meetings/:id" element={<MeetingDetailPage />} />
         <Route path="/action-items" element={<ActionItemsPage />} />
         <Route path="/record" element={<RecordPage />} />
+        <Route path="/calendar" element={<CalendarPage />} />
         <Route path="/reports" element={<ReportsListPage />} />
         <Route path="/reports/:id" element={<ReportDetailPage />} />
       </Route>
