@@ -335,11 +335,49 @@ MMDD 會議主題
 - multi_sheet 功能仍保留（`?multi_sheet=true`），但會議通知不用，留給未來其他場景
 
 ### Google Calendar 自動加入
-- 每 1 分鐘檢查 Google Calendar
-- 在會議前10分鐘發提醒到群組
-- 會議開始前 2 分鐘自動加入有 Google Meet 連結的會議
-- 加入後在 TG 群組通知
-- 已經加入過的會議不要重複加入（用 meet_id 判斷）
+
+實際機制：
+- 獨立背景 process **calendar-poller**（`services/calendar-poller/`）每 1 分鐘輪詢所有 active 的 `nb_calendar_accounts`，跑在 `./vexa.sh up` 啟動的 Bun 進程裡（不在 Docker、不在 Claude Code session 內）
+- poller 發現事件就 POST 到 webhook-channel `/hooks/calendar-upcoming`，**不直接派 bot**，交給 Claude 決定
+- 兩個 phase：
+  - **T-5**（會議前 4:30 ~ 5:30）→ 發提醒到 dept 群組
+  - **T-1**（會議前 0:30 ~ 1:30）→ 派 bot 加入會議（join_meeting 內建 recap，不需要再發通知）
+- 去重：T-5 用 `nb_calendar_notified (event_id, phase='T-5')`；T-1 用 `nb_calendar_auto_joined (event_id)`
+
+#### 收到 phase=T-5 channel 通知時
+
+1. 發提醒到 dept TG 群組（chat_id 從 channel meta 取，不是 1064895221）：
+   ```
+   📅 5 分鐘後會議：{title}
+   時間：{HH:MM}（UTC+8）
+   參與者：N 人
+   🎥 https://meet.google.com/{meet_id}
+   ```
+
+2. **順手排 oneshot cron 做 T-1 雙保險**（防 poller 在 T-5 ~ T-1 之間掛掉、Google API 失敗等狀況）：
+   ```
+   set_cron(
+     name="oneshot-join-{event_id}",
+     schedule="<T-1 絕對時間的 cron 表達式>",
+     webhook_path="/hooks/calendar-upcoming?phase=T-1&event_id=...&meet_id=...&chat_id=...&dept_id=...&title=...&start_time=..."
+   )
+   ```
+   T-1 絕對時間 = start_time - 1 分鐘，換成 UTC+8 後產生 cron 表達式（例：`29 15 19 5 *`）
+
+#### 收到 phase=T-1 channel 通知時
+
+1. 呼叫 `mcp__vexa__join_meeting(meet_id=..., chat_id=..., bot_name="NoirsBoxes 會議助理")`
+   - join_meeting 內建會自動發 Recap 到 dept 群組，**不要額外發訊息**
+
+2. 如果這個 T-1 是從 T-5 自排的 oneshot cron 進來的（用 `list_crons()` 查有沒有 `oneshot-join-{event_id}` 這個名字），就呼叫 `delete_cron(name="oneshot-join-{event_id}")` 清掉
+   - 沒有就跳過（代表是 poller 正常 fire 進來，不是 oneshot）
+
+#### 設計原則
+
+- poller 是「stateless 反應式」：只看當下 calendar 有什麼，不維護「預定加入清單」這種狀態
+- Claude 自排的 oneshot cron 是 defense in depth — 雙保險不會重複加入（dedupe table 擋）
+- 不處理「會議被取消」的情境（poller 下次掃看不到就不再發；oneshot cron 觸發後 Claude 收到 channel 通知，照常走流程；交給使用者人工處理）
+- 不重複發通知：T-5 / T-1 各有 dedupe table 防 poller 重複發；oneshot 跟 poller 互相 dedupe
 
 ### 跟催
 - 每天早上 9 點（UTC+8）會收到 `<channel source="vexa-webhook">` 的 `daily_reminder` 事件

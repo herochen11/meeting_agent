@@ -29,6 +29,11 @@ DASHBOARD_WEB_PID="/tmp/dashboard_web.pid"
 DASHBOARD_API_LOG="/tmp/dashboard_api.log"
 DASHBOARD_WEB_LOG="/tmp/dashboard_web.log"
 
+# Calendar Poller — 獨立背景程序，輪詢 Google Calendar，1 分鐘一次
+CALENDAR_POLLER_DIR="$SCRIPT_DIR/services/calendar-poller"
+CALENDAR_POLLER_PID="/tmp/calendar_poller.pid"
+CALENDAR_POLLER_LOG="/tmp/calendar_poller.log"
+
 # 我們需要的服務
 SERVICES=(
   api-gateway
@@ -118,6 +123,50 @@ dashboard_status() {
   done
 }
 
+# Calendar Poller 管理函式
+calendar_poller_up() {
+  if [ -f "$CALENDAR_POLLER_PID" ] && kill -0 "$(cat "$CALENDAR_POLLER_PID")" 2>/dev/null; then
+    warn "calendar-poller 已在運行 (PID $(cat "$CALENDAR_POLLER_PID"))，跳過"
+    return
+  fi
+  log "啟動 calendar-poller（Bun 背景輪詢，1 分鐘一次）..."
+  cd "$CALENDAR_POLLER_DIR"
+  # 用 dashboard_api 的 .env 共用 DB / OAuth 設定（兩者本來就同一組憑證 + DB）
+  if [ -f "$DASHBOARD_API_DIR/.env" ]; then
+    nohup bun --env-file="$DASHBOARD_API_DIR/.env" src/index.ts > "$CALENDAR_POLLER_LOG" 2>&1 &
+  else
+    warn "找不到 $DASHBOARD_API_DIR/.env，calendar-poller 將用 process 環境變數啟動"
+    nohup bun src/index.ts > "$CALENDAR_POLLER_LOG" 2>&1 &
+  fi
+  echo $! > "$CALENDAR_POLLER_PID"
+  cd "$SCRIPT_DIR"
+  sleep 1
+  log "calendar-poller 已啟動 → log: $CALENDAR_POLLER_LOG"
+}
+
+calendar_poller_down() {
+  if [ -f "$CALENDAR_POLLER_PID" ]; then
+    pid=$(cat "$CALENDAR_POLLER_PID")
+    if kill -0 "$pid" 2>/dev/null; then
+      log "停止 calendar-poller (PID $pid)..."
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$CALENDAR_POLLER_PID"
+  fi
+  # 防 zombie：把所有跑 calendar-poller/src/index.ts 的 bun process 都清掉
+  pkill -f "calendar-poller/src/index.ts" 2>/dev/null || true
+}
+
+calendar_poller_status() {
+  log "calendar-poller:"
+  if [ -f "$CALENDAR_POLLER_PID" ] && kill -0 "$(cat "$CALENDAR_POLLER_PID")" 2>/dev/null; then
+    pid=$(cat "$CALENDAR_POLLER_PID")
+    echo "  ✓ calendar-poller (PID $pid) — log: $CALENDAR_POLLER_LOG"
+  else
+    echo "  ✗ calendar-poller 未運行"
+  fi
+}
+
 case "$1" in
 
   up)
@@ -126,6 +175,7 @@ case "$1" in
     log "啟動 speaches（本地 Whisper）..."
     $SPEACHES_COMPOSE up -d
     dashboard_up
+    calendar_poller_up
     log "完成！使用 ./vexa.sh status 確認狀態"
     ;;
 
@@ -136,6 +186,8 @@ case "$1" in
     $SPEACHES_COMPOSE down
     log "關閉 dashboard..."
     dashboard_down
+    log "關閉 calendar-poller..."
+    calendar_poller_down
     log "完成"
     ;;
 
@@ -144,9 +196,11 @@ case "$1" in
     $COMPOSE down
     $SPEACHES_COMPOSE down
     dashboard_down
+    calendar_poller_down
     $COMPOSE up -d "${SERVICES[@]}"
     $SPEACHES_COMPOSE up -d
     dashboard_up
+    calendar_poller_up
     log "完成"
     ;;
 
@@ -157,6 +211,8 @@ case "$1" in
     $SPEACHES_COMPOSE ps
     echo ""
     dashboard_status
+    echo ""
+    calendar_poller_status
     ;;
 
   dashboard-up)
@@ -165,6 +221,14 @@ case "$1" in
 
   dashboard-down)
     dashboard_down
+    ;;
+
+  calendar-poller-up)
+    calendar_poller_up
+    ;;
+
+  calendar-poller-down)
+    calendar_poller_down
     ;;
 
   logs)
@@ -220,6 +284,8 @@ case "$1" in
     echo "  ./vexa.sh admin-down         關閉 admin-api"
     echo "  ./vexa.sh dashboard-up       單獨啟動 dashboard (api + web)"
     echo "  ./vexa.sh dashboard-down     單獨關閉 dashboard"
+    echo "  ./vexa.sh calendar-poller-up   單獨啟動 calendar-poller（背景輪詢）"
+    echo "  ./vexa.sh calendar-poller-down 單獨關閉 calendar-poller"
     echo "  ./vexa.sh agent              啟動 Claude Code Meeting Agent"
     echo ""
     echo "可用服務："

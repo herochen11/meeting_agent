@@ -96,7 +96,8 @@ Claude Code Session（WSL）
 | speaches | 8020 | 本地 Whisper（取代 Vexa Cloud 轉錄） |
 | dashboard_api | 8765 | Dashboard 後端 API（Bun + Hono） |
 | dashboard_web | 5173 | Dashboard 前端（Vite + React） |
-| webhook-channel | 8901 | 會議結束通知 + 跟催觸發 |
+| webhook-channel | 8901 | 會議結束通知 + 跟催觸發 + 行事曆事件通知 |
+| calendar-poller | — | 每 1 分鐘輪詢所有 active 的 `nb_calendar_accounts`，發現 T-5 / T-2 內有 Meet 連結的事件就 POST 到 webhook-channel（無 HTTP server，log: `/tmp/calendar_poller.log`） |
 
 ---
 

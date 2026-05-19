@@ -56,7 +56,7 @@ async function lookupNativeMeetingId(meetingId: unknown): Promise<{ value: strin
 // 部門歸屬以派發 bot 時寫入 nb_meetings.department_id 為唯一來源，不再讀 meeting_map.json
 const NB_DATABASE_URL =
   process.env.NB_DATABASE_URL ||
-  "postgres://postgres:postgres@localhost:5460/nb_dashboard";
+  "postgres://postgres:postgres@localhost:5458/vexa";
 const nbSql = postgres(NB_DATABASE_URL, {
   max: 2,
   idle_timeout: 30,
@@ -296,6 +296,177 @@ Bun.serve({
         return new Response(JSON.stringify({ error: String(err) }), {
           status: 500,
           headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // Calendar upcoming event trigger（calendar-poller 觸發）
+    // phase=T-5：5 分鐘前提醒（+ Claude 自排 oneshot cron 做 T-1 雙保險）
+    // phase=T-1：1 分鐘前自動加入
+    if (req.method === "POST" && url.pathname === "/hooks/calendar-upcoming") {
+      try {
+        const phaseQuery = url.searchParams.get("phase") || "";
+        const body = await req.json().catch(() => ({} as Record<string, unknown>));
+        const phase = String(body.phase || phaseQuery || "");
+        const eventId = String(body.event_id || "");
+        const meetId = String(body.meet_id || "");
+        const title = String(body.title || "(無標題)");
+        const startTime = String(body.start_time || "");
+        const deptId = body.dept_id !== undefined && body.dept_id !== null ? String(body.dept_id) : "";
+        const chatId = String(body.chat_id || "");
+        const attendees = Array.isArray(body.attendees) ? body.attendees : [];
+
+        if (phase !== "T-5" && phase !== "T-1") {
+          return new Response(
+            JSON.stringify({ error: "invalid phase（必須是 T-5 或 T-1）" }),
+            { status: 400, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (!meetId || !eventId) {
+          return new Response(
+            JSON.stringify({ error: "meet_id / event_id 為必填" }),
+            { status: 400, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        // 查部門名稱（補資訊用，查不到也不擋）
+        let deptName = "";
+        if (deptId) {
+          try {
+            const rows = await nbSql<{ name: string | null }[]>`
+              SELECT name FROM nb_departments WHERE id = ${Number(deptId)} LIMIT 1
+            `;
+            deptName = rows[0]?.name ?? "";
+          } catch (err) {
+            log(`Calendar upcoming dept lookup error: ${err}`);
+          }
+        }
+
+        // 起訖時間顯示用（HH:MM，UTC+8）
+        let startDisplay = startTime;
+        try {
+          const d = new Date(startTime);
+          if (!Number.isNaN(d.getTime())) {
+            // 轉成 UTC+8 顯示
+            const local = new Date(d.getTime() + 8 * 60 * 60 * 1000);
+            const hh = String(local.getUTCHours()).padStart(2, "0");
+            const mm = String(local.getUTCMinutes()).padStart(2, "0");
+            startDisplay = `${hh}:${mm}（UTC+8）`;
+          }
+        } catch {}
+
+        log(
+          `Calendar upcoming: phase=${phase} event_id=${eventId} meet_id=${meetId} ` +
+            `dept_id=${deptId} dept_name=${deptName} chat_id=${chatId} ` +
+            `start=${startTime} attendees=${attendees.length}`,
+        );
+
+        const meetUrl = meetId ? `https://meet.google.com/${meetId}` : "";
+
+        const lines: string[] = [
+          `🔔 行事曆事件通知（phase=${phase}）`,
+          ``,
+          `會議 (Meet ID: ${meetId}) 即將開始`,
+          `標題：${title}`,
+          `時間：${startDisplay}`,
+          deptName || deptId
+            ? `部門：${deptName || "(未知)"}（dept_id=${deptId || "?"}, chat_id=${chatId || "(未設定)"}）`
+            : `⚠️ 部門查無對應，請依 event_id / meet_id 自行確認後處理`,
+          `參與者：${attendees.length} 人`,
+          ``,
+          `⚠️ 部門歸屬規則（嚴格遵守）`,
+          `dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 bot 時寫入的）。`,
+          `禁止讀 config/meeting_map.json 做「修正」— 該檔僅供歷史除錯，不可作為決策依據。`,
+          `若占位 row 不存在，再依 chat_id 查 nb_departments；不要查 meeting_map.json。`,
+          ``,
+          `請處理（主 agent 直接做，動作快不需 sub-agent）：`,
+          ``,
+        ];
+
+        if (phase === "T-5") {
+          // 算 T-1 的絕對時間（會議開始時間 - 1 分鐘），轉成 UTC+8 的 cron 表達式
+          // 例：start_time=2026-05-19T07:30:00Z → T-1 = 07:29 UTC = 15:29 UTC+8
+          //     → cron: "29 15 19 5 *"
+          let cronExpr = "<無法計算，請依 start_time 自行算 T-1 絕對時間>";
+          try {
+            const d = new Date(startTime);
+            if (!Number.isNaN(d.getTime())) {
+              const tMinus1 = new Date(d.getTime() - 60 * 1000); // T-1
+              // 系統時區 UTC+8
+              const local = new Date(tMinus1.getTime() + 8 * 60 * 60 * 1000);
+              const mm = local.getUTCMinutes();
+              const hh = local.getUTCHours();
+              const dd = local.getUTCDate();
+              const mo = local.getUTCMonth() + 1;
+              cronExpr = `${mm} ${hh} ${dd} ${mo} *`;
+            }
+          } catch {}
+
+          lines.push(
+            `- phase=T-5 → 兩件事都要做：`,
+            ``,
+            `  1) 發提醒到 dept 群組（用 mcp__plugin_telegram_telegram__reply, chat_id=${chatId || "<部門 chat_id>"}）：`,
+            `     📅 5 分鐘後會議：${title}`,
+            `     時間：${startDisplay}`,
+            `     參與者：${attendees.length} 人`,
+            meetUrl ? `     🎥 ${meetUrl}` : `     🎥 https://meet.google.com/${meetId}`,
+            ``,
+            `  2) 排 oneshot cron 做 T-1 雙保險（防 poller 在 T-5 ~ T-1 之間掛掉）：`,
+            `     mcp__vexa__set_cron(`,
+            `       name="oneshot-join-${eventId}",`,
+            `       schedule="${cronExpr}",`,
+            `       webhook_path="/hooks/calendar-upcoming?phase=T-1&event_id=${eventId}&meet_id=${meetId}&chat_id=${chatId || ""}&dept_id=${deptId || ""}&title=${encodeURIComponent(title)}&start_time=${encodeURIComponent(startTime)}"`,
+            `     )`,
+            `     ⚠️ 該 cron 觸發後（你收到 phase=T-1 channel 通知時）自己呼叫 delete_cron(name="oneshot-join-${eventId}") 清掉，避免每天重複 fire`,
+          );
+        } else {
+          // T-1
+          lines.push(
+            `- phase=T-1 → 兩件事：`,
+            ``,
+            `  1) 呼叫 mcp__vexa__join_meeting(meet_id="${meetId}", chat_id="${chatId || "<部門 chat_id>"}", bot_name="NoirsBoxes 會議助理")`,
+            `     （join_meeting 會自動觸發 Recap 流程，不需要額外發訊息）`,
+            ``,
+            `  2) 如果這次 T-1 是從 T-5 排的 oneshot cron 過來的，呼叫 mcp__vexa__delete_cron(name="oneshot-join-${eventId}") 清掉那個 cron`,
+            `     （查 list_crons() 看到 oneshot-join-${eventId} 才需要刪，沒有就跳過）`,
+          );
+        }
+
+        lines.push(
+          ``,
+          `- 失敗 → 用 mcp__plugin_telegram_telegram__reply DM Brian (chat_id=1064895221) 報告錯誤，不重試。`,
+        );
+
+        const content = lines.join("\n");
+
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content,
+            meta: {
+              event: "calendar.upcoming",
+              phase,
+              event_id: eventId,
+              meet_id: meetId,
+              title,
+              start_time: startTime,
+              dept_id: deptId,
+              dept_name: deptName,
+              chat_id: chatId,
+              attendees_count: String(attendees.length),
+            },
+          },
+        });
+
+        log(`Calendar upcoming notification SENT for event_id=${eventId} phase=${phase}`);
+        return new Response(JSON.stringify({ status: "accepted" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        log(`Calendar upcoming error: ${err}`);
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
         });
       }
     }
