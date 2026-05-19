@@ -2,12 +2,6 @@ import { Hono } from "hono";
 import ExcelJS from "exceljs";
 import { sql, type ActionItem } from "../db";
 import { getDeptId, requireDept, type DeptVars } from "../auth";
-import {
-  appendActionItemRow,
-  updateActionItemRow,
-  type SheetActionItemRow,
-  type SheetUpdates,
-} from "../lib/sheets";
 
 export const actionItemsRoute = new Hono<{ Variables: DeptVars }>();
 
@@ -28,15 +22,12 @@ function fmtDate(d: Date | string | null): string {
   return `${y}-${m}-${day}`;
 }
 
-/** 查該部門的 sheet_id（可能為 null） */
-async function getDeptSheetId(deptId: number): Promise<{
-  sheet_id: string | null;
-  name: string;
-}> {
-  const rows = await sql<{ sheet_id: string | null; name: string }[]>`
-    SELECT sheet_id, name FROM nb_departments WHERE id = ${deptId} LIMIT 1
+/** 查該部門名稱（用於 Excel 匯出檔名） */
+async function getDeptName(deptId: number): Promise<{ name: string }> {
+  const rows = await sql<{ name: string }[]>`
+    SELECT name FROM nb_departments WHERE id = ${deptId} LIMIT 1
   `;
-  return rows[0] ?? { sheet_id: null, name: "" };
+  return rows[0] ?? { name: "" };
 }
 
 /**
@@ -83,135 +74,65 @@ actionItemsRoute.get("/api/action-items", async (c) => {
   return c.json(rows);
 });
 
+type ExportRow = Pick<
+  ActionItem,
+  "code" | "description" | "assignee" | "priority" | "status" | "due_date" | "notes"
+>;
+
+// ── 樣式常數 ──（給 populateSheet 共用）
+const HEADER_FILL = {
+  type: "pattern" as const,
+  pattern: "solid" as const,
+  fgColor: { argb: "FFDBEAFE" }, // 淺藍
+};
+const OWNER_FILL = {
+  type: "pattern" as const,
+  pattern: "solid" as const,
+  fgColor: { argb: "FFFEF3C7" }, // 橘黃
+};
+const IN_PROGRESS_FILL = {
+  type: "pattern" as const,
+  pattern: "solid" as const,
+  fgColor: { argb: "FFFFFBEB" }, // 淺黃
+};
+const WHITE_FILL = {
+  type: "pattern" as const,
+  pattern: "solid" as const,
+  fgColor: { argb: "FFFFFFFF" }, // 白
+};
+const COMPLETED_FILL = {
+  type: "pattern" as const,
+  pattern: "solid" as const,
+  fgColor: { argb: "FFE5E7EB" }, // 灰
+};
+const CELL_BORDER = {
+  top: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
+  left: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
+  bottom: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
+  right: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
+};
+
+const COLUMN_WIDTHS = [12, 60, 12, 8, 8, 14, 30] as const;
+
 /**
- * Excel 匯出：GET /api/action-items/export.xlsx
- * 規格（與 Brian 之前手寫 Python 腳本一致）：
- *   - Sheet 名稱：`未完成 Action Items`
- *   - 表頭 7 欄：編號 / 任務描述 / 負責人 / 優先級 / 狀態 / 預計完成時間 / 備註
- *   - Freeze A2、表頭粗體 + 淺藍底 #DBEAFE
- *   - 依 assignee ASC 分組（無負責人放最後）；每組前插入跨欄合併的 owner header row
- *     （▾ owner_name，橘黃底 #FEF3C7，bold 12pt）
- *   - 進行中 → 淺黃 #FFFBEB；未開始 → 白；已完成 → 灰 + 描述刪除線
- *   - Column widths：12 / 60 / 12 / 8 / 8 / 14 / 30
- *
- * 可選 query：
- *   - ?status=（未開始/進行中/已完成）  顯式指定狀態時，不再套用「排除已完成」
- *   - ?assignee=（部分比對）
- *   - ?includeCompleted=true            預設只匯出未開始+進行中；加此參數才包含已完成
- * 回傳 binary xlsx，附 Content-Disposition。
+ * 將 rows 寫入指定 worksheet（含表頭、樣式、owner header row、配色）。
+ * 由 export.xlsx handler 共用（單分頁 / multi_sheet 模式都呼叫這個）。
  */
-actionItemsRoute.get("/api/action-items/export.xlsx", async (c) => {
-  const deptId = getDeptId(c);
-  const statusFilter = c.req.query("status");
-  const assigneeFilter = c.req.query("assignee");
-  const includeCompletedRaw = c.req.query("includeCompleted");
-  const includeCompleted =
-    includeCompletedRaw === "true" || includeCompletedRaw === "1";
-
-  if (statusFilter && !ALLOWED_STATUS.has(statusFilter)) {
-    return c.json({ error: "status 僅允許 未開始 / 進行中 / 已完成" }, 400);
-  }
-
-  // 若顯式指定 status，則不套用「排除已完成」（讓使用者能單獨拉已完成）
-  const excludeCompleted = !statusFilter && !includeCompleted;
-
-  // 部門資訊（拿 name 做檔名）
-  const dept = await getDeptSheetId(deptId);
-
-  // 撈該部門資料；ORDER BY 依 assignee ASC（無負責人放最後）+ code
-  type ExportRow = Pick<
-    ActionItem,
-    "code" | "description" | "assignee" | "priority" | "status" | "due_date" | "notes"
-  >;
-  let rows: ExportRow[];
-  if (statusFilter && assigneeFilter) {
-    rows = await sql<ExportRow[]>`
-      SELECT code, description, assignee, priority, status, due_date, notes
-      FROM nb_action_items
-      WHERE department_id = ${deptId}
-        AND status = ${statusFilter}
-        AND assignee ILIKE ${"%" + assigneeFilter + "%"}
-      ORDER BY COALESCE(assignee, 'zzz'), code
-    `;
-  } else if (statusFilter) {
-    rows = await sql<ExportRow[]>`
-      SELECT code, description, assignee, priority, status, due_date, notes
-      FROM nb_action_items
-      WHERE department_id = ${deptId}
-        AND status = ${statusFilter}
-      ORDER BY COALESCE(assignee, 'zzz'), code
-    `;
-  } else if (assigneeFilter) {
-    rows = await sql<ExportRow[]>`
-      SELECT code, description, assignee, priority, status, due_date, notes
-      FROM nb_action_items
-      WHERE department_id = ${deptId}
-        AND assignee ILIKE ${"%" + assigneeFilter + "%"}
-        AND (${!excludeCompleted}::bool OR status != '已完成')
-      ORDER BY COALESCE(assignee, 'zzz'), code
-    `;
-  } else {
-    rows = await sql<ExportRow[]>`
-      SELECT code, description, assignee, priority, status, due_date, notes
-      FROM nb_action_items
-      WHERE department_id = ${deptId}
-        AND (${!excludeCompleted}::bool OR status != '已完成')
-      ORDER BY COALESCE(assignee, 'zzz'), code
-    `;
-  }
-
-  const wb = new ExcelJS.Workbook();
-  wb.creator = "NoirsBoxes Dashboard";
-  wb.created = new Date();
-
-  const ws = wb.addWorksheet("未完成 Action Items", {
-    views: [{ state: "frozen", ySplit: 1 }],
-  });
-
+function populateSheet(
+  ws: ExcelJS.Worksheet,
+  rows: ExportRow[],
+): void {
   // 用 ws.columns 設定 keys + widths（在寫入 header values 之前，這樣 widths
   // 一定會被 ExcelJS 序列化）。Header values 會在下方手動覆寫並套樣式。
   ws.columns = [
-    { key: "code", width: 12 },
-    { key: "description", width: 60 },
-    { key: "assignee", width: 12 },
-    { key: "priority", width: 8 },
-    { key: "status", width: 8 },
-    { key: "due_date", width: 14 },
-    { key: "notes", width: 30 },
+    { key: "code", width: COLUMN_WIDTHS[0] },
+    { key: "description", width: COLUMN_WIDTHS[1] },
+    { key: "assignee", width: COLUMN_WIDTHS[2] },
+    { key: "priority", width: COLUMN_WIDTHS[3] },
+    { key: "status", width: COLUMN_WIDTHS[4] },
+    { key: "due_date", width: COLUMN_WIDTHS[5] },
+    { key: "notes", width: COLUMN_WIDTHS[6] },
   ];
-
-  // ── 樣式常數 ──
-  const HEADER_FILL = {
-    type: "pattern" as const,
-    pattern: "solid" as const,
-    fgColor: { argb: "FFDBEAFE" }, // 淺藍
-  };
-  const OWNER_FILL = {
-    type: "pattern" as const,
-    pattern: "solid" as const,
-    fgColor: { argb: "FFFEF3C7" }, // 橘黃
-  };
-  const IN_PROGRESS_FILL = {
-    type: "pattern" as const,
-    pattern: "solid" as const,
-    fgColor: { argb: "FFFFFBEB" }, // 淺黃
-  };
-  const WHITE_FILL = {
-    type: "pattern" as const,
-    pattern: "solid" as const,
-    fgColor: { argb: "FFFFFFFF" }, // 白
-  };
-  const COMPLETED_FILL = {
-    type: "pattern" as const,
-    pattern: "solid" as const,
-    fgColor: { argb: "FFE5E7EB" }, // 灰
-  };
-  const CELL_BORDER = {
-    top: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
-    left: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
-    bottom: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
-    right: { style: "thin" as const, color: { argb: "FFE5E7EB" } },
-  };
 
   // ── 表頭（row 1，7 欄）──
   const headers = [
@@ -302,21 +223,167 @@ actionItemsRoute.get("/api/action-items/export.xlsx", async (c) => {
   }
 
   // 再次強制設定 column widths（避免 ExcelJS 在寫入 header 文字後自動推算覆寫）
-  const finalWidths = [12, 60, 12, 8, 8, 14, 30];
-  finalWidths.forEach((w, idx) => {
+  COLUMN_WIDTHS.forEach((w, idx) => {
     ws.getColumn(idx + 1).width = w;
   });
+}
 
-  const buffer = await wb.xlsx.writeBuffer();
+/**
+ * Excel 匯出：GET /api/action-items/export.xlsx
+ *
+ * 兩種模式：
+ *
+ * 【單分頁模式】（沒帶 multi_sheet）
+ *   - 一個 worksheet（`未完成 Action Items`），預設只匯出未完成（未開始+進行中）
+ *   - 可選 query：
+ *     - ?status=（未開始/進行中/已完成）  顯式指定狀態時，不再套用「排除已完成」
+ *     - ?assignee=（部分比對）
+ *     - ?includeCompleted=true            預設只匯出未開始+進行中；加此參數才包含已完成
+ *
+ * 【multi_sheet 模式】（?multi_sheet=true）
+ *   - 兩個 worksheet：
+ *     1. `所有未完成`（status IN ('未開始','進行中')）
+ *     2. `進行中`（status='進行中'）
+ *   - 兩個分頁都依 assignee + code 排序
+ *   - status / assignee / includeCompleted query 都被忽略（schema 固定）
+ *
+ * 共用規格：
+ *   - 表頭 7 欄：編號 / 任務描述 / 負責人 / 優先級 / 狀態 / 預計完成時間 / 備註
+ *   - Freeze A2、表頭粗體 + 淺藍底 #DBEAFE
+ *   - 依 assignee ASC 分組（無負責人放最後）；每組前插入跨欄合併的 owner header row
+ *     （▾ owner_name，橘黃底 #FEF3C7，bold 12pt）
+ *   - 進行中 → 淺黃 #FFFBEB；未開始 → 白；已完成 → 灰 + 描述刪除線
+ *   - Column widths：12 / 60 / 12 / 8 / 8 / 14 / 30
+ *
+ * 回傳 binary xlsx，附 Content-Disposition。
+ */
+actionItemsRoute.get("/api/action-items/export.xlsx", async (c) => {
+  const deptId = getDeptId(c);
+
+  const multiSheetRaw = c.req.query("multi_sheet");
+  const multiSheet = multiSheetRaw === "true" || multiSheetRaw === "1";
+
+  // 部門資訊（拿 name 做檔名）
+  const dept = await getDeptName(deptId);
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "NoirsBoxes Dashboard";
+  wb.created = new Date();
 
   const today = fmtDate(new Date());
-  // 檔名：Action-Items-{部門名稱}-{未完成 or 完整}-{YYYY-MM-DD}.xlsx
   const deptName = dept.name || `dept-${deptId}`;
-  const scopeLabel = excludeCompleted ? "未完成" : "完整";
-  const fnameAscii = `Action-Items-${deptId}-${scopeLabel === "未完成" ? "open" : "all"}-${today}.xlsx`;
-  const fnameUtf8 = encodeURIComponent(
-    `Action-Items-${deptName}-${scopeLabel}-${today}.xlsx`,
-  );
+  let fnameAscii: string;
+  let fnameUtf8: string;
+
+  if (multiSheet) {
+    // 兩分頁：所有未完成 + 進行中
+    const openRows = await sql<ExportRow[]>`
+      SELECT code, description, assignee, priority, status, due_date, notes
+      FROM nb_action_items
+      WHERE department_id = ${deptId}
+        AND status IN ('未開始', '進行中')
+      ORDER BY COALESCE(assignee, 'zzz'),
+               CASE WHEN status = '進行中' THEN 0 ELSE 1 END,
+               code
+    `;
+    const inProgressRows = await sql<ExportRow[]>`
+      SELECT code, description, assignee, priority, status, due_date, notes
+      FROM nb_action_items
+      WHERE department_id = ${deptId}
+        AND status = '進行中'
+      ORDER BY COALESCE(assignee, 'zzz'),
+               CASE WHEN status = '進行中' THEN 0 ELSE 1 END,
+               code
+    `;
+
+    const wsAll = wb.addWorksheet("所有未完成", {
+      views: [{ state: "frozen", ySplit: 1 }],
+    });
+    populateSheet(wsAll, openRows);
+
+    const wsInProgress = wb.addWorksheet("進行中", {
+      views: [{ state: "frozen", ySplit: 1 }],
+    });
+    populateSheet(wsInProgress, inProgressRows);
+
+    fnameAscii = `Action-Items-${deptId}-open+in-progress-${today}.xlsx`;
+    fnameUtf8 = encodeURIComponent(
+      `Action-Items-${deptName}-未完成+進行中-${today}.xlsx`,
+    );
+  } else {
+    // 單分頁：沿用既有 filter 行為
+    const statusFilter = c.req.query("status");
+    const assigneeFilter = c.req.query("assignee");
+    const includeCompletedRaw = c.req.query("includeCompleted");
+    const includeCompleted =
+      includeCompletedRaw === "true" || includeCompletedRaw === "1";
+
+    if (statusFilter && !ALLOWED_STATUS.has(statusFilter)) {
+      return c.json({ error: "status 僅允許 未開始 / 進行中 / 已完成" }, 400);
+    }
+
+    // 若顯式指定 status，則不套用「排除已完成」（讓使用者能單獨拉已完成）
+    const excludeCompleted = !statusFilter && !includeCompleted;
+
+    // 撈該部門資料；ORDER BY 依 assignee ASC（無負責人放最後）+ code
+    let rows: ExportRow[];
+    if (statusFilter && assigneeFilter) {
+      rows = await sql<ExportRow[]>`
+        SELECT code, description, assignee, priority, status, due_date, notes
+        FROM nb_action_items
+        WHERE department_id = ${deptId}
+          AND status = ${statusFilter}
+          AND assignee ILIKE ${"%" + assigneeFilter + "%"}
+        ORDER BY COALESCE(assignee, 'zzz'),
+               CASE WHEN status = '進行中' THEN 0 ELSE 1 END,
+               code
+      `;
+    } else if (statusFilter) {
+      rows = await sql<ExportRow[]>`
+        SELECT code, description, assignee, priority, status, due_date, notes
+        FROM nb_action_items
+        WHERE department_id = ${deptId}
+          AND status = ${statusFilter}
+        ORDER BY COALESCE(assignee, 'zzz'),
+               CASE WHEN status = '進行中' THEN 0 ELSE 1 END,
+               code
+      `;
+    } else if (assigneeFilter) {
+      rows = await sql<ExportRow[]>`
+        SELECT code, description, assignee, priority, status, due_date, notes
+        FROM nb_action_items
+        WHERE department_id = ${deptId}
+          AND assignee ILIKE ${"%" + assigneeFilter + "%"}
+          AND (${!excludeCompleted}::bool OR status != '已完成')
+        ORDER BY COALESCE(assignee, 'zzz'),
+               CASE WHEN status = '進行中' THEN 0 ELSE 1 END,
+               code
+      `;
+    } else {
+      rows = await sql<ExportRow[]>`
+        SELECT code, description, assignee, priority, status, due_date, notes
+        FROM nb_action_items
+        WHERE department_id = ${deptId}
+          AND (${!excludeCompleted}::bool OR status != '已完成')
+        ORDER BY COALESCE(assignee, 'zzz'),
+               CASE WHEN status = '進行中' THEN 0 ELSE 1 END,
+               code
+      `;
+    }
+
+    const ws = wb.addWorksheet("未完成 Action Items", {
+      views: [{ state: "frozen", ySplit: 1 }],
+    });
+    populateSheet(ws, rows);
+
+    const scopeLabel = excludeCompleted ? "未完成" : "完整";
+    fnameAscii = `Action-Items-${deptId}-${scopeLabel === "未完成" ? "open" : "all"}-${today}.xlsx`;
+    fnameUtf8 = encodeURIComponent(
+      `Action-Items-${deptName}-${scopeLabel}-${today}.xlsx`,
+    );
+  }
+
+  const buffer = await wb.xlsx.writeBuffer();
 
   c.header(
     "Content-Type",
@@ -424,58 +491,8 @@ actionItemsRoute.post("/api/action-items", async (c) => {
   `;
   const row = inserted[0]!;
 
-  // ── 反向同步到 Sheet（DB 已 commit；Sheet 失敗只 warning） ──
-  let sheetSynced = false;
-  let sheetWarning: string | null = null;
-  const dept = await getDeptSheetId(deptId);
-
-  if (!dept.sheet_id) {
-    sheetWarning = "該部門未設定 sheet_id，略過 Sheet 同步";
-  } else {
-    // 取會議 meet_id / start_time 以填 Sheet 對應欄位（可能 null）
-    let meetIdStr = "";
-    let meetingDateStr = "";
-    if (meetingId !== null) {
-      const m = await sql<
-        { meet_id: string | null; start_time: Date | null }[]
-      >`
-        SELECT meet_id, start_time FROM nb_meetings WHERE id = ${meetingId} LIMIT 1
-      `;
-      if (m[0]) {
-        meetIdStr = m[0].meet_id ?? "";
-        meetingDateStr = fmtDate(m[0].start_time);
-      }
-    }
-
-    const sheetRow: SheetActionItemRow = {
-      code: row.code,
-      description: row.description,
-      assignee: row.assignee ?? "",
-      priority: row.priority ?? "中",
-      status: row.status ?? "未開始",
-      due_date: fmtDate(row.due_date),
-      source_meeting: meetIdStr,
-      meeting_date: meetingDateStr,
-      notes: row.notes ?? "",
-    };
-
-    try {
-      await appendActionItemRow(dept.sheet_id, sheetRow);
-      sheetSynced = true;
-    } catch (e) {
-      sheetWarning = `Sheet append 失敗（DB 已成功）: ${e instanceof Error ? e.message : String(e)}`;
-      console.warn("[action-items] " + sheetWarning);
-    }
-  }
-
-  return c.json(
-    {
-      ...row,
-      sheet_synced: sheetSynced,
-      ...(sheetWarning ? { sheet_warning: sheetWarning } : {}),
-    },
-    201,
-  );
+  // 自 2026-05-19 起不再寫入 Google Sheets — DB 為唯一資料來源
+  return c.json(row, 201);
 });
 
 interface UpdateBody {
@@ -576,53 +593,6 @@ actionItemsRoute.patch("/api/action-items/:id", async (c) => {
   `;
   const row = updated[0]!;
 
-  // ── 反向同步到 Sheet ──
-  let sheetSynced = false;
-  let sheetWarning: string | null = null;
-  const dept = await getDeptSheetId(deptId);
-
-  if (!dept.sheet_id) {
-    sheetWarning = "該部門未設定 sheet_id，略過 Sheet 同步";
-  } else if (!row.code) {
-    sheetWarning = "Action Item 沒有 code，無法定位 Sheet row";
-  } else {
-    // 映射 DB column → Sheet field（雙寫對稱）
-    const sheetUpdates: SheetUpdates = {};
-    if (updates.description !== undefined) {
-      sheetUpdates.description = updates.description ?? "";
-    }
-    if (updates.assignee !== undefined) {
-      sheetUpdates.assignee = updates.assignee ?? "待確認";
-    }
-    if (updates.priority !== undefined) {
-      sheetUpdates.priority = updates.priority ?? "中";
-    }
-    if (updates.status !== undefined) {
-      sheetUpdates.status = updates.status ?? "未開始";
-    }
-    if (updates.due_date !== undefined) {
-      sheetUpdates.due_date = updates.due_date ?? "";
-    }
-    if (updates.notes !== undefined) {
-      sheetUpdates.notes = updates.notes ?? "";
-    }
-
-    if (Object.keys(sheetUpdates).length === 0) {
-      sheetSynced = true; // 沒有 Sheet 對應欄位要更新，視為成功
-    } else {
-      try {
-        await updateActionItemRow(dept.sheet_id, row.code, sheetUpdates);
-        sheetSynced = true;
-      } catch (e) {
-        sheetWarning = `Sheet 更新失敗（DB 已成功）: ${e instanceof Error ? e.message : String(e)}`;
-        console.warn("[action-items] " + sheetWarning);
-      }
-    }
-  }
-
-  return c.json({
-    ...row,
-    sheet_synced: sheetSynced,
-    ...(sheetWarning ? { sheet_warning: sheetWarning } : {}),
-  });
+  // 自 2026-05-19 起不再寫入 Google Sheets — DB 為唯一資料來源
+  return c.json(row);
 });

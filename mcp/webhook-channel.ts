@@ -52,6 +52,79 @@ async function lookupNativeMeetingId(meetingId: unknown): Promise<{ value: strin
   }
 }
 
+// NoirsBoxes Dashboard Postgres 連線（用來查 nb_meetings → nb_departments 的對應）
+// 部門歸屬以派發 bot 時寫入 nb_meetings.department_id 為唯一來源，不再讀 meeting_map.json
+const NB_DATABASE_URL =
+  process.env.NB_DATABASE_URL ||
+  "postgres://postgres:postgres@localhost:5460/nb_dashboard";
+const nbSql = postgres(NB_DATABASE_URL, {
+  max: 2,
+  idle_timeout: 30,
+  connect_timeout: 5,
+  onnotice: () => {},
+});
+
+/**
+ * 用 meet_id 查 nb_meetings JOIN nb_departments，取得 chat_id + dept_id + 部門名稱
+ * 部門歸屬以派發 bot 時寫入的 nb_meetings.department_id 為唯一來源
+ * 若 DB 查不到才 fallback 讀 meeting_map.json
+ */
+async function lookupDeptByMeetId(meetId: string): Promise<{
+  chatId: string;
+  deptId: string;
+  deptName: string;
+  source: "db" | "meeting_map_fallback" | "none";
+}> {
+  if (!meetId) return { chatId: "", deptId: "", deptName: "", source: "none" };
+
+  // 主路徑：DB lookup（dispatch-source-of-truth）
+  try {
+    const rows = await nbSql<
+      { chat_id: string | null; dept_id: number | null; dept_name: string | null }[]
+    >`
+      SELECT d.chat_id AS chat_id,
+             m.department_id AS dept_id,
+             d.name AS dept_name
+      FROM nb_meetings m
+      JOIN nb_departments d ON m.department_id = d.id
+      WHERE m.meet_id = ${meetId}
+      ORDER BY m.id DESC
+      LIMIT 1
+    `;
+    const first = rows[0];
+    if (first && first.chat_id) {
+      return {
+        chatId: first.chat_id,
+        deptId: String(first.dept_id ?? ""),
+        deptName: first.dept_name ?? "",
+        source: "db",
+      };
+    }
+  } catch (err) {
+    log(`NB DB lookup error for meet_id=${meetId}: ${err}`);
+  }
+
+  // Fallback：emergency backup（只在 DB 查不到時用，不可作為決策依據）
+  try {
+    const fs = await import("fs");
+    const path = await import("path");
+    const mapPath = path.resolve(
+      new URL("../config/meeting_map.json", import.meta.url).pathname,
+    );
+    const raw = fs.readFileSync(mapPath, "utf-8");
+    const map = JSON.parse(raw) as Record<string, unknown>;
+    const v = map[meetId];
+    if (typeof v === "string" && v) {
+      log(`⚠️  Fallback to meeting_map.json for meet_id=${meetId} → ${v}（DB 查不到，僅供緊急備援）`);
+      return { chatId: v, deptId: "", deptName: "", source: "meeting_map_fallback" };
+    }
+  } catch (err) {
+    log(`meeting_map.json fallback error for meet_id=${meetId}: ${err}`);
+  }
+
+  return { chatId: "", deptId: "", deptName: "", source: "none" };
+}
+
 // 建立 MCP 伺服器並聲明為 channel
 const mcp = new Server(
   { name: 'vexa-webhook', version: '1.0.0' },
@@ -62,7 +135,7 @@ const mcp = new Server(
     instructions: [
       '來自 vexa-webhook channel 的事件是會議結束通知。',
       '收到通知後，請立即呼叫 summarize_meeting 工具處理該會議。',
-      '完成後把摘要和 Action Items 寫入 Google Sheets，在 Google Drive 建立會議記錄，並透過 TG 發送摘要給團隊。',
+      '完成後把 Action Items 寫入 nb_action_items DB，會議記錄寫入本地 markdown（meeting_agent/records/{部門}/），並透過 TG 發送摘要給團隊。',
     ].join(' '),
   },
 )
@@ -88,6 +161,94 @@ Bun.serve({
       });
     }
 
+    // Weekly report trigger
+    if (req.method === "POST" && url.pathname === "/hooks/weekly-report") {
+      try {
+        const chatId = url.searchParams.get("chat_id") || "";
+        const department = url.searchParams.get("department") || "";
+        const deptId = url.searchParams.get("dept_id") || "";
+        log(`Weekly report triggered: chat_id=${chatId} department=${department} dept_id=${deptId}`);
+
+        // 計算上一週的時間範圍（上週一 00:00 ~ 上週日 23:59:59，UTC+8）
+        // 觸發時機是每週一早上 9 點，所以「上一週」= 上週一 ~ 上週日
+        const content = [
+          `📊 週報自動生成觸發`,
+          ``,
+          `部門：${department} (dept_id=${deptId}, chat_id=${chatId})`,
+          ``,
+          `請按照 CLAUDE.md「週報處理規則」spawn sub-agent：`,
+          `1. 計算上一週的時間範圍（上週一 00:00 ~ 上週日 23:59:59，UTC+8）`,
+          `2. 從 nb_meetings 撈該期間 + 部門的會議（含 summary）`,
+          `3. 從 nb_action_items 撈該期間新增 / 完成 / 進行中的 Action Items（依負責人聚合）`,
+          `4. 產生議題式 markdown 報表（會議列表、Action Items 統計、各負責人工作量、主要議題、待跟進）`,
+          `5. INSERT 到 nb_reports（type='weekly', period_start=上週一, period_end=上週日, dept_id, title, content_md, stats_json）`,
+          `6. DM Brian (chat_id=1064895221) 報生成完成 + dashboard 連結`,
+        ].join("\n");
+
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: content,
+            meta: { event: "weekly_report", chat_id: chatId, department: department, dept_id: deptId },
+          },
+        });
+
+        log(`Weekly report notification SENT`);
+        return new Response(JSON.stringify({ status: "accepted" }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        log(`Weekly report error: ${err}`);
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // Monthly report trigger
+    if (req.method === "POST" && url.pathname === "/hooks/monthly-report") {
+      try {
+        const chatId = url.searchParams.get("chat_id") || "";
+        const department = url.searchParams.get("department") || "";
+        const deptId = url.searchParams.get("dept_id") || "";
+        log(`Monthly report triggered: chat_id=${chatId} department=${department} dept_id=${deptId}`);
+
+        const content = [
+          `📊 月報自動生成觸發`,
+          ``,
+          `部門：${department} (dept_id=${deptId}, chat_id=${chatId})`,
+          ``,
+          `請按照 CLAUDE.md「月報處理規則」spawn sub-agent：`,
+          `1. 計算上個月的時間範圍（上月 1 號 00:00 ~ 上月最後一天 23:59:59，UTC+8）`,
+          `2. 從 nb_meetings 撈該期間 + 部門的會議（含 summary）`,
+          `3. 從 nb_action_items 撈該期間新增 / 完成 / 進行中的 Action Items（依負責人聚合）`,
+          `4. 產生月度議題式 markdown 報表（會議總覽、Action Items 統計、各負責人月度工作量、主要議題、未完成跟進、月度趨勢）`,
+          `5. INSERT 到 nb_reports（type='monthly', period_start=上月 1 號, period_end=上月底, dept_id, title, content_md, stats_json）`,
+          `6. DM Brian (chat_id=1064895221) 報生成完成 + dashboard 連結`,
+        ].join("\n");
+
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: content,
+            meta: { event: "monthly_report", chat_id: chatId, department: department, dept_id: deptId },
+          },
+        });
+
+        log(`Monthly report notification SENT`);
+        return new Response(JSON.stringify({ status: "accepted" }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        log(`Monthly report error: ${err}`);
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
     // Daily reminder trigger
     if (req.method === "POST" && url.pathname === "/hooks/daily-reminder") {
       try {
@@ -103,7 +264,7 @@ Bun.serve({
           department ? `部門: ${department}` : "",
           sheetId ? `sheet_id: ${sheetId}` : "",
           ``,
-          `請檢查該部門 Google Sheets 中的 Action Items：`,
+          `請檢查該部門 nb_action_items DB 中的 Action Items：`,
           `1. 找出未完成的任務（預計完成時間 < 今天 且 狀態 ≠ 已完成）`,
           `2. 找出截止前 1 天的任務（即將到期）`,
           `3. 產生跟催報告並透過 TG 發送到該部門的群組`,
@@ -127,6 +288,81 @@ Bun.serve({
         return new Response(JSON.stringify({ error: String(err) }), {
           status: 500,
           headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // Local recording completed webhook
+    // 由 dashboard_api 的 /api/recordings 處理完 speaches 轉錄後觸發
+    if (req.method === "POST" && url.pathname === "/hooks/local-recording-completed") {
+      try {
+        const body = await req.json();
+        const meetId = String(body.meet_id || "");
+        const deptId = body.dept_id;
+        const title = String(body.title || "");
+        const transcript = String(body.transcript || "");
+        const duration = body.duration;
+
+        log(
+          `Local recording completed: meet_id=${meetId} dept_id=${deptId} ` +
+          `title="${title}" duration=${duration ?? "?"}s transcript_len=${transcript.length}`,
+        );
+
+        const content = [
+          `🎙️ 本地錄音完成`,
+          ``,
+          `部門 ID: ${deptId}, Meet ID: ${meetId}, 時長: ${duration ?? "?"}s`,
+          `標題: ${title}`,
+          ``,
+          `⚠️ 部門歸屬規則（嚴格遵守）`,
+          `dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 / 錄音建立時寫入的）。`,
+          `禁止讀 config/meeting_map.json 做「修正」— 該檔僅供歷史除錯，不可作為決策依據。`,
+          `若占位 row 不存在，再依 chat_id 查 nb_departments；不要查 meeting_map.json。`,
+          ``,
+          `⚠️ 請用 Agent tool 生成 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
+          ``,
+          `Sub-agent 執行步驟：`,
+          `1. 用 mcp__plugin_telegram_telegram__reply(chat_id=1064895221, "⏳ 處理本地錄音中...") 發送處理中提示給 Brian，記下回傳的 message_id`,
+          `2. 用新版議題式 prompt 從附帶的逐字稿產生摘要 + Action Items（MMDD_N 編號）`,
+          `3. UPSERT nb_meetings (meet_id=${meetId})：`,
+          `   - UPDATE 現有 row → status='completed', title=正式標題, summary=議題式摘要,`,
+          `     end_time=NOW(), duration_minutes=${duration ? Math.round(duration / 60) : "null"},`,
+          `     transcript_md_path=...（記得保留 source='local-recording'）`,
+          `     ❗ 不要動 department_id，建立時寫入的就是正確的`,
+          `4. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${meetId}.md`,
+          `   - 含 metadata、議題式摘要、Action Items、完整逐字稿`,
+          `5. 用 append_action_items 寫入 nb_action_items DB（department_id 用步驟 3 的 row）`,
+          `6. 用 mcp__plugin_telegram_telegram__edit_message(chat_id=1064895221, message_id, "✅ 處理完成") 更新處理中訊息`,
+          `7. 用 mcp__plugin_telegram_telegram__reply 發新訊息 DM Brian (chat_id=1064895221) 帶完整摘要 + Dashboard 連結（觸發推撥）`,
+          `   ⚠️ 本地錄音不走 TG 群組，只 DM Brian`,
+          ``,
+          `=== 逐字稿 ===`,
+          transcript || "(無內容)",
+        ].join("\n");
+
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: content,
+            meta: {
+              event: "local_recording_completed",
+              meet_id: meetId,
+              dept_id: String(deptId ?? ""),
+              title: title,
+              duration: duration ?? null,
+            },
+          },
+        });
+
+        log(`Local recording notification SENT for meet_id=${meetId}`);
+        return new Response(JSON.stringify({ status: "accepted" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        log(`Local recording webhook error: ${err}`);
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
         });
       }
     }
@@ -185,23 +421,47 @@ Bun.serve({
           }
         }
 
+        // 部門歸屬：以 nb_meetings.department_id（派發時寫入）為唯一來源
+        // ❌ 禁止讀 meeting_map.json 做「修正」，該檔僅供 DB 查不到時的緊急備援
+        const deptInfo = await lookupDeptByMeetId(nativeMeetingId);
+        log(
+          `Dept lookup for meet_id=${nativeMeetingId}: ` +
+          `chat_id=${deptInfo.chatId || "(empty)"} dept_id=${deptInfo.deptId || "(empty)"} ` +
+          `dept_name=${deptInfo.deptName || "(empty)"} source=${deptInfo.source}`,
+        );
+
         // 按官方格式推 channel notification
         const content = [
           `🔔 會議結束通知`,
           ``,
           `會議 (DB ID: ${meetingId}, Meet ID: ${nativeMeetingId}) 已結束。`,
+          deptInfo.chatId
+            ? `部門：${deptInfo.deptName || "(未知)"} (dept_id=${deptInfo.deptId || "?"}, chat_id=${deptInfo.chatId})`
+            : `⚠️ 部門查無對應（DB 與 meeting_map.json 都沒命中），請依 chat_id 重新確認後處理`,
+          ``,
+          `⚠️ 部門歸屬規則（嚴格遵守）`,
+          `dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 bot 時寫入的）。`,
+          `禁止讀 config/meeting_map.json 做「修正」— 該檔僅供歷史除錯，不可作為決策依據。`,
+          `若占位 row 不存在，再依 chat_id 查 nb_departments；不要查 meeting_map.json。`,
           ``,
           `⚠️ 請用 Agent tool 生成 sub-agent 處理，主 agent 保持空閒接收其他請求。`,
           ``,
           `Sub-agent 執行步驟：`,
-          `1. 呼叫 send_processing(chat_id) 發送處理中提示`,
+          `1. 用 mcp__plugin_telegram_telegram__reply(chat_id=${deptInfo.chatId || "<部門 chat_id>"}, "⏳ 處理中...") 發送處理中提示，記下回傳的 message_id`,
           `2. 呼叫 summarize_meeting(meeting_id=${meetingId}) 取得逐字稿`,
           `   - native_meeting_id: ${nativeMeetingId}`,
           `3. 產生摘要和 Action Items`,
-          `4. 把 Action Items 寫入 Google Sheets`,
-          `5. 在 Google Drive 建立會議記錄（含摘要 + Action Items + 完整逐字稿）`,
-          `6. 用 edit_message 更新處理中狀態為完成`,
-          `7. 透過 TG 發送完整摘要給團隊（含 Google Sheet 和 Doc 連結）`,
+          `4. UPSERT nb_meetings：`,
+          `   - SELECT 同 meet_id 的占位 row（派發 bot 時建立，department_id 為派發來源）`,
+          `   - 有 → UPDATE 該 row（title=正式標題, status='completed', end_time=NOW(), summary=..., transcript_md_path=...）`,
+          `     ❗ 不要動 department_id，派發時寫入的就是正確的`,
+          `   - 沒有 → INSERT 新 row，department_id 依 chat_id 查 nb_departments`,
+          `5. 用 append_action_items 把 Action Items 寫入 nb_action_items DB（department_id 用步驟 4 的 row）`,
+          `6. 寫本地 markdown 到 records/{部門}/MMDD_{標題}_${nativeMeetingId}.md`,
+          `   （含 metadata、議題式摘要、Action Items、完整逐字稿；自動更新 nb_meetings.summary + transcript_md_path）`,
+          `7. 用 mcp__plugin_telegram_telegram__edit_message(chat_id, message_id, "✅ 處理完成") 更新處理中訊息`,
+          `8. 用 mcp__plugin_telegram_telegram__reply 發新訊息帶完整摘要 + Excel 附件（觸發推撥）`,
+          `   - Excel 從 dashboard_api /api/action-items/export.xlsx 下載`,
         ].join("\n");
 
         await mcp.notification({
@@ -215,6 +475,10 @@ Bun.serve({
               platform: platform,
               start_time: startTime,
               end_time: endTime,
+              chat_id: deptInfo.chatId,
+              dept_id: deptInfo.deptId,
+              dept_name: deptInfo.deptName,
+              dept_source: deptInfo.source,
             },
           },
         });

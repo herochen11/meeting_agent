@@ -2,6 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { Hono } from "hono";
 import { sql } from "../db";
 import { getDeptId, requireDept, type DeptVars } from "../auth";
+import { buildRecap, sendTgMessage } from "../lib/recap";
 
 export const botRoute = new Hono<{ Variables: DeptVars }>();
 
@@ -200,6 +201,16 @@ botRoute.post("/api/bot/join", async (c) => {
   } catch (err) {
     placeholderWarning = `nb_meetings 占位 INSERT 失敗（不影響派 bot）：${(err as Error).message}`;
     console.warn(placeholderWarning);
+  }
+
+  // 發 recap 到該部門群組（失敗只 warning，不擋 join 流程）
+  try {
+    const recap = await buildRecap(deptId, meetId);
+    if (recap) {
+      await sendTgMessage(chatId, recap);
+    }
+  } catch (err) {
+    console.warn(`Recap 發送失敗：${(err as Error).message}`);
   }
 
   const response: {

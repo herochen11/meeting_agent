@@ -13,7 +13,9 @@
 
 ## 工具使用規則（嚴格遵守）
 
-- 操作 Google Drive / Sheets / Calendar 時，一律使用 Google MCP 工具
+- 自 2026-05-19 起，**Action Items / 會議記錄 / 報表皆不再寫入 Google Drive / Sheets / Doc**，
+  DB（PostgreSQL `nb_*` tables）+ 本地 markdown 為唯一資料來源
+- 仍可用 Google Calendar MCP 工具讀取行事曆排程
 - 操作 Vexa API 時，一律使用 Vexa MCP 工具
 - ❗ 絕對禁止用 Bash 執行 curl、python、wget 來操作任何 API
 - ❗ 絕對禁止自己處理 OAuth token、credentials.json、token.json
@@ -32,18 +34,17 @@
 - `summarize_meeting` — 讀取逐字稿準備摘要
 
 ### Google MCP
-- Google Drive — 建立資料夾、上傳檔案
-- Google Sheets — 讀寫 Action Items
-- Google Calendar — 查詢會議排程
+- Google Calendar — 查詢會議排程（仍使用）
+- ⚠️ Google Drive / Sheets / Docs — 目前流程不再呼叫，MCP tool 雖仍註冊但不會被走到
 
 ### 部門與人員設定（config/departments.json）
 - `get_config` — 讀取部門對應表 + 人員對應表（可用 chat_id 篩選）
-- `add_department` — 新增部門（chat_id、名稱、sheet_id、drive_folder_id）
+- `add_department` — 新增部門（chat_id、名稱；sheet_id / drive_folder_id 保留欄位，可不填）
 - `update_member` — 更新人員的 TG Username 或逐字稿名字
 
 重要：
-- 每次操作 Google Sheets 或 Drive 前，先用 `get_config(chat_id=xxx)` 查出對應的 sheet_id 和 drive_folder_id
-- 收到 TG 訊息時，用 chat_id 查詢部門，確保寫入正確的 Sheet
+- 收到 TG 訊息時，用 chat_id 查詢部門，確保寫入正確的 DB 部門範圍（department_id）
+- 注意：config 中的 `sheet_id` / `drive_folder_id` / `unfinished_view_gid` 為歷史欄位，目前流程不使用
 
 ### Cron 定時任務管理
 - `set_cron` — 建立或更新定時任務（如每日跟催、週報）
@@ -51,44 +52,48 @@
 - `delete_cron` — 刪除定時任務
 
 ### Telegram 通知
-- `send_processing` — 發送「處理中」提示訊息到 TG 群組，回傳 message_id（後續用 edit_message 更新狀態）
+- ✅ **目前流程一律使用 `mcp__plugin_telegram_telegram__reply` / `mcp__plugin_telegram_telegram__edit_message`**（同一個 bot session 從頭到尾，避免 token 不一致造成 edit 失效）
+- ⚠️ `send_processing`（Vexa MCP 中的舊工具）仍保留註冊，但**新流程不再呼叫**；只供手動 / 向後相容用途
 
 使用範例：
-- 設定單一部門跟催：`set_cron(name="reminder-業務部", schedule="0 9 * * *", webhook_path="/hooks/daily-reminder?chat_id=XXX&department=業務部&sheet_id=YYY")`
-- 修改時間：`set_cron(name="reminder-業務部", schedule="0 10 * * *", webhook_path="/hooks/daily-reminder?chat_id=XXX&department=業務部&sheet_id=YYY")`
+- 設定單一部門跟催：`set_cron(name="reminder-業務部", schedule="0 9 * * *", webhook_path="/hooks/daily-reminder?chat_id=XXX&department=業務部")`
+- 修改時間：`set_cron(name="reminder-業務部", schedule="0 10 * * *", webhook_path="/hooks/daily-reminder?chat_id=XXX&department=業務部")`
 - 取消跟催：`delete_cron(name="reminder-業務部")`
 - 查看所有定時任務：`list_crons()`
 
 跟催 cron 命名規則：`reminder-{部門名稱}`，每個部門一個 cron。
-webhook_path 必須帶 chat_id、department、sheet_id 參數，讓 Claude 知道要查哪個 Sheet、發到哪個群組。
+webhook_path 必須帶 chat_id、department 參數，讓 Claude 知道對應哪個部門、發到哪個群組。
+（舊的 `sheet_id` 參數可選；目前流程改讀 DB，不再使用該參數）
 
 注意：時區為系統時區，確認是 UTC 還是 UTC+8 再設定。
 
 ---
 
-## Google Drive 目錄架構
+## Google Drive 目錄架構（歷史參考，目前流程不再寫入）
+
+⚠️ 自 2026-05-19 起，**所有 Action Items / 會議記錄 / 月報皆不再寫入 Google Drive / Sheets / Doc**。
+DB（PostgreSQL `nb_*` tables）+ 本地 markdown（`meeting_agent/records/{部門}/`）為唯一資料來源，
+Dashboard 直接讀 DB 顯示。MCP tools（`create_sheet`、`append_action_items`、`update_action_item` 等）仍保留註冊但流程不會呼叫到 Sheet/Doc 部分。
+
+以下架構為過去已建立的歷史檔案，**保留供查閱**：
 
 ```
 NoirsBoxes 會議管理/
 ├── {部門名稱}/
-│   ├── Action Items.gsheet          ← 持續更新，不可刪除
+│   ├── Action Items.gsheet          ← 歷史 Sheet，已凍結
 │   ├── YYYY-MM/
-│   │   ├── MMDD {會議主題}.gdoc     ← 每場會議記錄
-│   │   └── YYYY-MM 月報.docx        ← 月底自動產生
+│   │   ├── MMDD {會議主題}.gdoc     ← 歷史會議記錄
+│   │   └── YYYY-MM 月報.docx        ← 歷史月報
 │   └── ...
 └── 跨部門月報/
     └── YYYY-MM 全公司月報.docx
 ```
 
-### 命名規則
-- 資料夾：`YYYY-MM`（如 `2026-05`）
-- 會議記錄：`MMDD {摘要標題} ({Meet ID})`
-  - 範例：`0505 客戶提案與韌體修復討論 (tqe-qopc-fhp)`
-  - 摘要標題來源優先順序：
-    1. Google Calendar 事件名稱（最優先）
-    2. Claude 根據逐字稿內容自動產生簡短標題（10 字以內）
-  - Meet ID 一律附在括號裡，方便對照
-- 月報：`YYYY-MM 月報`（如 `2026-05 月報`）
+### 會議標題命名規則（仍適用於 DB nb_meetings.title 與本地 markdown）
+- 會議記錄檔名：`MMDD_{摘要標題}_{meet_id}.md`
+- 摘要標題來源優先順序：
+  1. Google Calendar 事件名稱（最優先）
+  2. Claude 根據逐字稿內容自動產生簡短標題（10 字以內）
 
 ---
 
@@ -110,19 +115,18 @@ NoirsBoxes 會議管理/
 0428_4 ~ 0428_5  ← 第二場會議
 ```
 
-### Google Sheets 欄位
+### Action Items 欄位（對應 nb_action_items DB 欄位）
 
-| 欄位 | 說明 |
+| 欄位（DB column） | 說明 |
 |---|---|
-| 編號 | MMDD_N 格式 |
-| 任務描述 | 具體的任務內容 |
-| 負責人 | 團隊成員名稱 |
-| 優先級 | 高 / 中 / 低 |
-| 狀態 | 未開始 / 進行中 / 已完成 |
-| 預計完成時間 | YYYY-MM-DD |
-| 來源會議 | Meet ID |
-| 會議日期 | YYYY-MM-DD |
-| 備註 | 補充說明 |
+| code | MMDD_N 格式 |
+| description | 具體的任務內容 |
+| assignee | 團隊成員名稱 |
+| priority | 高 / 中 / 低 |
+| status | 未開始 / 進行中 / 已完成 |
+| due_date | YYYY-MM-DD |
+| meeting_id → meet_id | 來源會議（透過 nb_meetings 關聯） |
+| notes | 補充說明 |
 
 ### 任務描述撰寫規範
 - 任務描述必須具體到「別人不看逐字稿也知道要做什麼」的程度
@@ -141,10 +145,10 @@ NoirsBoxes 會議管理/
 不使用「逾期」狀態。逾期判斷方式：預計完成時間 < 今天 且 狀態 ≠ 已完成。
 
 ### 寫入規則
-- 新增 Action Items 時用 append（新增行）
-- 可以更新任意儲存格的內容（修改負責人、狀態、截止日、任務描述等）
-- ❗ 不可以刪除整行、整列、或清空 Sheet
-- 寫入前確認 Sheet 存在，不存在則先建立
+- 新增 Action Items 一律寫入 nb_action_items DB（透過 `append_action_items` MCP tool 或 dashboard_api POST /api/action-items）
+- 可以更新任意欄位（修改負責人、狀態、截止日、任務描述等）
+- ❗ 不可以刪除整筆紀錄、清空整個部門的 Action Items
+- 自 2026-05-19 起不再寫入 Google Sheets — 歷史 Sheet 保留但凍結，不再同步
 
 ### Action Items 彙整 / 匯出規則（Excel、TG 整理、跟催通知等）
 
@@ -164,9 +168,10 @@ NoirsBoxes 會議管理/
 
 ## 會議記錄格式（本地 Markdown）
 
-⚠️ 注意：自 2026-05-18 起，**會議記錄不再寫入 Google Doc**，只寫本地 markdown 檔（`meeting_agent/records/{部門}/`）。
-Dashboard 從 markdown 檔直接讀取顯示。
-歷史的 Google Doc 仍保留供查閱。
+⚠️ 注意：自 2026-05-19 起，**Action Items / 會議記錄 / 報表皆不再寫入 Google Drive / Sheets / Doc**。
+DB（PostgreSQL `nb_*` tables）+ 本地 markdown（`meeting_agent/records/{部門}/`）為唯一資料來源。
+Dashboard 從 DB + markdown 檔直接讀取顯示。
+歷史的 Google Doc / Sheet 仍保留供查閱（不再同步、不再寫入）。
 
 每場會議結束後，在對應部門資料夾下產生一個 markdown 檔（命名 `MMDD_{標題}_{meet_id}.md`），格式如下：
 
@@ -253,29 +258,54 @@ NoirsBoxes {部門名稱} — YYYY 年 M 月會議報告
 
 ## 自動觸發規則
 
+### 派發 bot 時自動 Recap
+
+每次 `join_meeting` 成功派發 bot（不論透過 mcp tool 還是 dashboard）後，**會自動發一則 recap 到該部門 TG 群組**，包含：
+- 即將開始的會議（meet_id）
+- 上次該部門 completed 會議的議題摘要第一段
+- 該部門所有未完成 Action Items（依負責人分組，進行中優先）
+
+實作位置：
+- `mcp/server.py` `_join_meeting`：在 Vexa API + DB INSERT 後呼叫 `_build_recap()` + `_send_tg_message()`
+- `services/dashboard_api/src/routes/bot.ts` `/api/bot/join`：同上邏輯（TS 版本，helper 在 `src/lib/recap.ts`）
+
+兩邊 recap 內容**必須一致**。
+
+如失敗（TG API error 等）只 warning，不擋 join_meeting 主流程。
+
 ### 收到會議結束通知時
 當你看到 `<channel source="vexa-webhook">` 的會議結束通知：
+
+⚠️ **部門歸屬規則（嚴格遵守）**
+- dept_id 永遠取 `nb_meetings.department_id` 該 row 的值（派發 bot 時寫入的）— 這是**唯一來源**
+- ❌ 禁止讀 `config/meeting_map.json` 做「修正」或「驗證」— 該檔已 deprecated，僅供歷史除錯，不可作為決策依據
+- 若占位 row 不存在（兼容流程），再依 chat_id 查 `nb_departments`；**不要查 meeting_map.json**
+
+步驟：
 1. 呼叫 `summarize_meeting` 取得逐字稿
 2. 產生摘要和 Action Items（含 MMDD_N 編號，按新版議題式 prompt 格式）
 3. UPSERT 到 `nb_meetings`：
    - 先查是否已有同 meet_id 且 status IN ('會議進行中', '逐字稿處理中') 的占位 row
      - 派發 bot 時建立 `會議進行中`，webhook 進來時 webhook-channel.ts 會自動改成 `逐字稿處理中`
    - 有 → UPDATE 該 row（title 改為議題式摘要的第一個議題或自動產生標題、status='completed'、end_time、summary、participants、transcript_md_path 等）
-   - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程）
-4. 用 `append_action_items` 寫入（自動雙寫 DB + Google Sheets 副本）
+     - ❗ **不要動 `department_id`** — 派發時寫入的就是正確的部門歸屬
+   - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程），`department_id` 依 chat_id 查 `nb_departments`，**不要查 meeting_map.json**
+4. 用 `append_action_items` 寫入 nb_action_items DB（用步驟 3 row 的 `department_id`）
 5. 寫入本地 markdown：`meeting_agent/records/{部門}/MMDD_{標題}_{meet_id}.md`
    - 完整內容：metadata + 議題式摘要 + Action Items + 完整逐字稿
    - 同時更新 `nb_meetings.summary` + `transcript_md_path`（步驟 3 的 UPDATE / INSERT 可一併處理）
 6. 透過 TG 發送摘要和確認訊息（測試模式則改發 DM 給 Brian chat_id=1064895221）
-7. ❌ 不再寫 Google Doc — 長會議 Doc 寫入太慢，Dashboard 直接讀本地 md 顯示即可
+7. ❌ 不再寫 Google Sheets / Google Doc / Google Drive — DB + 本地 markdown 為唯一資料來源，Dashboard 直接讀取顯示
 
 ### TG 通知格式（會議結束）
 
 發送會議結束通知時：
-1. **不再貼 Action Items 表格在訊息中**（客戶不愛 TG 內條列）
-2. **不再貼 Action Items Sheet 連結**
-3. **改成附上 Excel 檔**（依該部門全部未完成 Action Items 整理：依負責人分組、僅含未開始 + 進行中、排除已完成）
-4. Excel 從 `dashboard_api` 的 `GET /api/action-items/export.xlsx` 取（需 dept 登入）或用 sub-agent 直接生成
+1. **不再貼 Action Items 表格在訊息中**
+2. **不再貼任何 Google Sheet / Doc 連結**
+3. **附 Excel 檔**（單分頁）：
+   - 一個分頁列出所有未完成（未開始 + 進行中）
+   - 依負責人分組
+   - 同 owner 內：**進行中優先**、未開始次之、再按 code 排序
 
 訊息格式：
 ```
@@ -285,15 +315,24 @@ MMDD 會議主題
 【總結】
 {議題式摘要 — 第一個議題 + 條列}
 
-📎 附檔：{部門名稱}-未完成-{YYYY-MM-DD}.xlsx
-（含本部門所有未完成 Action Items，依負責人分組）
+📎 附檔：{部門名稱}-Action-Items-{YYYY-MM-DD}.xlsx
+（含本部門所有未完成，依負責人分組，進行中項目排在前）
 
 ────────────────────
-📌 本次會議產生 N 個新 Action Item（已寫入 DB 並同步 Sheet）
+📌 本次會議產生 N 個新 Action Item（已寫入 DB）
+完整摘要請至 Dashboard 查看
 如需修改請直接 @我
 ```
 
-Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegram_telegram__reply` 呼叫裡。
+實作說明：
+- Sub-agent 從 dashboard_api 拉 Excel：
+  ```bash
+  curl -b cookies.txt "http://localhost:8765/api/action-items/export.xlsx" \
+    -o /tmp/{部門}-Action-Items-{date}.xlsx
+  ```
+- 然後用 `mcp__plugin_telegram_telegram__reply` 帶 `files=[...]` 參數附上
+- 不再用 Sheet deep-link
+- multi_sheet 功能仍保留（`?multi_sheet=true`），但會議通知不用，留給未來其他場景
 
 ### Google Calendar 自動加入
 - 每 1 分鐘檢查 Google Calendar
@@ -307,7 +346,7 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 - 收到後執行以下步驟：
 
 #### 跟催步驟
-1. 用 `get_action_items` 讀取 Google Sheets 中所有 Action Items
+1. 從 nb_action_items DB 讀取該部門所有 Action Items（直接 SQL 或用 dashboard_api `/api/action-items`）
 2. 用今天的日期判斷：
    - 截止前 1 天的任務 → 標記為「即將到期」
    - 未完成的任務（預計完成時間 < 今天 且 狀態 ≠ 已完成）→ 標記為「未完成」
@@ -333,10 +372,99 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 
 #### 跟催注意事項
 - 所有回覆使用繁體中文
-- 不要修改 Google Sheets 的任何內容，只讀取
+- 跟催只讀 DB，不寫入任何資料
 - 未完成判斷：預計完成時間 < 今天 且 狀態 ≠ 已完成
 - 不要使用「逾期」這個詞，用「未完成」代替
 - 跟催通知要 tag 負責人（用 @ 提及）
+
+### 週報處理規則
+
+每週一早上 9 點（UTC+8）會收到 `<channel source="vexa-webhook">` 的 `weekly_report` 事件，meta 含 `chat_id`、`department`、`dept_id`。
+
+收到後 **spawn sub-agent** 執行：
+
+1. **計算時間範圍**：上週一 00:00:00 ~ 上週日 23:59:59（UTC+8）
+2. **查資料**（用 docker exec psql 或既有 MCP tool）：
+   ```sql
+   -- 該部門該週的會議
+   SELECT id, title, meet_id, start_time, end_time, duration_minutes, summary
+   FROM nb_meetings
+   WHERE department_id = $dept_id
+     AND start_time >= $week_start AND start_time < $next_week_start
+     AND status = 'completed'
+   ORDER BY start_time;
+
+   -- 該部門該週新增 / 異動的 Action Items
+   SELECT code, description, assignee, priority, status, due_date, created_at, updated_at
+   FROM nb_action_items
+   WHERE department_id = $dept_id
+     AND (created_at >= $week_start OR updated_at >= $week_start)
+     AND (created_at < $next_week_start);
+   ```
+3. **聚合統計**：
+   - 會議總數、Action Items 新增 / 完成 / 進行中 / 未開始數
+   - 各負責人工作量（新增 / 完成）
+   - 識別主要議題（從 summaries 抽出共同主題）
+4. **生成 markdown 報表**（議題式，含表格）：
+   ```markdown
+   # {部門名稱} — 2026 第 WNN 週報
+
+   ## 本週概要
+   - 共 N 場會議、新增 M 個 Action Items、完成 K 個
+
+   ## 會議列表
+   - MM/DD 會議標題
+   - ...
+
+   ## Action Items 統計
+   | 負責人 | 新增 | 完成 | 未完成 |
+   |---|---|---|---|
+   | Brian | x | x | x |
+
+   ## 主要議題
+   - **議題 1**：…
+   - **議題 2**：…
+
+   ## 待跟進
+   - code 任務描述 — 負責人 · 截止 MM/DD
+   ```
+5. **INSERT 到 nb_reports**：
+   ```sql
+   INSERT INTO nb_reports (department_id, type, period_start, period_end, title, content_md, stats_json)
+   VALUES ($dept_id, 'weekly', $week_start::date, $week_end::date,
+           '{部門名稱} 第 WNN 週報',
+           $content_md, $stats_json::jsonb);
+   ```
+6. **DM Brian**（chat_id=`1064895221`）報生成完成 + dashboard 連結：
+   ```
+   📊 {部門} 週報已生成（W20）
+   {1-2 句重點摘要}
+   👉 http://localhost:5173/reports/{id}
+   ```
+
+⚠️ 不要因為「沒會議」就跳過 — 即使該週 0 場會議，也產一份簡短報表標明「本週無會議」。
+
+### 月報處理規則
+
+每月 1 號早上 9 點（UTC+8）會收到 `<channel source="vexa-webhook">` 的 `monthly_report` 事件，meta 含 `chat_id`、`department`、`dept_id`。
+
+收到後 spawn sub-agent，**邏輯類似週報但時間範圍是上個月整月**（1 號 00:00 ~ 該月最後一天 23:59:59）。
+
+內容額外加：
+- 月度趨勢（會議頻率 / Action Items 累積）
+- 跨會議的議題追蹤（哪些 Action Items 跨多場會議都有出現）
+- 未完成清單（截止日已過但未完成的）
+
+`INSERT type='monthly', period_start=上月1號, period_end=上月最後一天`。
+
+### 兩種報表的時區與排程
+
+| 報表 | Cron 觸發 | 涵蓋期間 |
+|---|---|---|
+| 週報 | `0 9 * * 1`（每週一 09:00 UTC+8） | 上週一 ~ 上週日 |
+| 月報 | `0 9 1 * *`（每月 1 號 09:00 UTC+8） | 上個月 1 號 ~ 上月底 |
+
+⚠️ 系統時區是 UTC+8（台北），cron 不用做時區轉換。
 
 ---
 
@@ -345,10 +473,12 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 ### 處理中提示（嚴格遵守）
 收到用戶訊息後，使用以下流程回覆：
 
-1. 立即呼叫 `send_processing(chat_id)` → 用戶看到「⏳ 處理中...」→ 記下回傳的 `message_id`
+1. 立即呼叫 `mcp__plugin_telegram_telegram__reply(chat_id, "⏳ 處理中...")` → 用戶看到「⏳ 處理中...」→ 記下回傳的 `message_id`
 2. 執行實際操作（查詢、寫入、生成報告等）
-3. 完成後用 `edit_message` 把「處理中」改成「✅ 完成」
-4. 發送一則新的 reply 帶完整內容（觸發推撥通知）
+3. 完成後用 `mcp__plugin_telegram_telegram__edit_message(chat_id, message_id, "✅ 處理完成")` 把「處理中」改成「✅ 完成」
+4. 用 `mcp__plugin_telegram_telegram__reply` 發送一則新訊息帶完整內容（觸發推撥通知）
+
+⚠️ 為什麼一律用 plugin 工具：舊版 `send_processing` 走的是 Vexa server 的 BOT_TOKEN，跟 plugin 用的 bot token 是**不同的 Telegram bot session**；用舊 bot 發的訊息，新 bot 的 `edit_message` 找不到。統一用 plugin 工具 = 同一個 bot 從頭到尾。
 
 注意：edit_message 不會觸發手機推撥，所以最終結果必須用新 reply 發送。
 
@@ -362,7 +492,7 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 
 任何預期 >30 秒、可獨立完成、不需要即時往返討論的任務：
 
-- 會議結束後的摘要處理（summarize → 寫 Sheets → 寫 Doc → 發 TG）
+- 會議結束後的摘要處理（summarize → 寫 DB → 寫本地 markdown → 發 TG）
 - 生成週報 / 月報
 - 跨部門大量資料查詢
 - 長音檔轉錄 / 大量檔案處理
@@ -384,7 +514,7 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 
 1. 收到請求 → 主 agent **立刻**回覆 acknowledgment（「在 ✅」、「⏳ 已交給 sub-agent 處理，預計 X 分鐘內完成」），tag 使用者
 2. 若任務 >30 秒，觸發 sub-agent
-3. Sub-agent 完成後自己發**新 reply** 帶結果（必須觸發推撥，不要只 edit_message）
+3. Sub-agent 完成後自己發**新 `mcp__plugin_telegram_telegram__reply`** 帶結果（必須觸發推撥，不要只用 edit_message）
 4. 主 agent 期間維持 standby，可以接其他訊息
 
 ❗ 不要先承諾「我來查一下」然後沉默 3 分鐘；要嘛立刻回結果，要嘛立刻說「交給 sub-agent，等等回」。  
@@ -394,19 +524,26 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 
 ```
 請生成 sub-agent 處理此會議摘要：meeting_id=7, chat_id=-5269102871, meet_id=xxx-xxxx-xxx。
+
+⚠️ 部門歸屬規則（嚴格遵守）
+dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 bot 時寫入的）。
+禁止讀 config/meeting_map.json 做「修正」— 該檔僅供歷史除錯，不可作為決策依據。
+若占位 row 不存在，再依 chat_id 查 nb_departments；不要查 meeting_map.json。
+
 執行步驟：
-1. 呼叫 send_processing(chat_id) 發送處理中提示
+1. 用 mcp__plugin_telegram_telegram__reply(chat_id, "⏳ 處理中...") 發送處理中提示，記下回傳的 message_id
 2. 呼叫 summarize_meeting(meeting_id=7) 取得逐字稿
 3. 產生摘要和 Action Items
 4. UPSERT 到 nb_meetings：
    - 先 SELECT 同 meet_id 且 status='會議進行中' 的占位 row（派發 bot 時建立）
    - 有 → UPDATE 該 row（title=正式標題, status='completed', end_time=NOW(),
      summary=..., participants=..., transcript_md_path=...）
-   - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程）
-5. 用 append_action_items 寫入（雙寫 DB + Google Sheets 副本）
+     ❗ 不要動 department_id，派發時寫入的就是正確的
+   - 沒有 → INSERT 新 row，department_id 依 chat_id 查 nb_departments（不查 meeting_map.json）
+5. 用 append_action_items 寫入 nb_action_items DB（用步驟 4 row 的 department_id）
 6. 寫入本地 markdown：meeting_agent/records/{部門}/MMDD_{標題}_{meet_id}.md
-7. 用 edit_message 更新狀態為完成
-8. 發送完整摘要到 TG 群組
+7. 用 mcp__plugin_telegram_telegram__edit_message(chat_id, message_id, "✅ 處理完成") 更新處理中訊息
+8. 用 mcp__plugin_telegram_telegram__reply 發新訊息帶完整摘要 + Excel 附件到 TG 群組（觸發推撥）
 ```
 
 ---
@@ -437,7 +574,7 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 
 ### 重要原則
 - 根據 TG 訊息的 chat_id 判斷來源部門
-- ❗ 每次操作 Google Sheets 或 Drive 前，必須先用 `get_config(chat_id=xxx)` 確認對應的部門
+- ❗ 每次寫入 DB（nb_action_items / nb_meetings / nb_reports）前，必須先用 `get_config(chat_id=xxx)` 確認對應的部門
 - ❗ 絕對不可跨部門寫入資料
 - ❗ 回覆必須回到原本的群組，不可發到其他群組
 
@@ -450,8 +587,8 @@ Excel 附檔以 `files=["/path/to/file.xlsx"]` 參數帶在 `mcp__plugin_telegra
 1. 用 `get_config(chat_id=xxx)` 查詢，確認是未知群組
 2. 告知使用者「偵測到新群組，請群組管理員提供部門名稱」
 3. 管理員回覆部門名稱後：
-   - 用 `create_sheet` 建立該部門的 Action Items Sheet
-   - 用 Google Drive MCP 建立該部門的資料夾
-   - 用 `add_department` 把 chat_id、sheet_id、drive_folder_id 寫入設定
+   - 用 `add_department` 把 chat_id、部門名稱寫入設定（sheet_id / drive_folder_id 留空）
+   - 在 nb_departments DB 也建立對應 row（dashboard 用）
+   - 在本地 `meeting_agent/records/{部門名稱}/` 建立資料夾，存放會議 markdown
    - 回覆確認：「已設定 {部門名稱} 的工作區」
 

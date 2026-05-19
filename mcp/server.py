@@ -512,6 +512,7 @@ async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsB
         if r.status_code in (200, 201):
             data = r.json()
             mid  = data.get("meeting_id") or data.get("id")
+            dept_id_for_recap = None
             # 記錄會議屬於哪個群組（部門隔離）
             if chat_id:
                 mapping = _read_meeting_map()
@@ -530,6 +531,7 @@ async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsB
                             dept_row = cur.fetchone()
                             if dept_row:
                                 dept_id = dept_row["id"]
+                                dept_id_for_recap = dept_id
                                 cur.execute(
                                     """
                                     INSERT INTO nb_meetings
@@ -549,6 +551,15 @@ async def _join_meeting(meet_id: str, chat_id: str = "", bot_name: str = "NoirsB
                                 )
                 except Exception as e:
                     logger.warning(f"join_meeting 占位 INSERT 失敗（不影響派 bot）: {e}")
+
+                # 發 recap 到該部門群組（失敗只 warning，不擋 join 流程）
+                if dept_id_for_recap is not None:
+                    try:
+                        recap_text = _build_recap(dept_id_for_recap, meet_id)
+                        if recap_text:
+                            await _send_tg_message(str(chat_id), recap_text)
+                    except Exception as e:
+                        logger.warning(f"Recap 發送失敗: {e}")
 
             return json.dumps({"success": True, "meet_id": meet_id, "meeting_id": mid}, ensure_ascii=False)
         elif r.status_code == 409:
@@ -682,11 +693,11 @@ async def _summarize_meeting(meeting_id: int, native_meeting_id: str = "", start
             "- ✅ 具體：「修復 PD-35 韌體 v2.1 快充模式斷電問題，完成後提供測試報告給 Brian 確認」\n"
             "- 每個 item 包含：負責人、截止日、優先級（高/中/低）\n\n"
             "【後續步驟】\n"
-            "1. 用 append_action_items 把 Action Items 寫入 nb_action_items DB（會自動同步寫 Google Sheets 副本）\n"
+            "1. 用 append_action_items 把 Action Items 寫入 nb_action_items DB\n"
             "2. 把對應 markdown 寫到 meeting_agent/records/{部門}/MMDD_{標題}_{meet_id}.md\n"
             "   （此步驟會自動更新 nb_meetings.summary + transcript_md_path，Dashboard 直接讀此檔顯示）\n"
             "3. 透過 TG 發送摘要到該部門群組（測試模式則改發 DM 給 Brian chat_id=1064895221）\n\n"
-            "❌ 不再寫 Google Doc — 長會議 Doc 寫入太慢，Dashboard 直接讀本地 markdown 即可。\n\n"
+            "❌ 不再寫入 Google Sheets / Google Doc / Google Drive — DB + 本地 markdown 為唯一資料來源，Dashboard 直接讀取顯示。\n\n"
             "⚠️ 語言處理：此會議以中文進行。逐字稿中如有整句英文，是語音辨識誤判（說中文但夾雜英文單字導致整句被轉為英文）。寫入 Markdown 時，請將這些英文段落翻譯為中文。產品型號、技術術語可保留英文原文。"
         )
     }, ensure_ascii=False)
@@ -817,24 +828,27 @@ def _mmdd_from_date(date_str: str) -> str:
 
 
 def _append_action_items(spreadsheet_id: str, items: list) -> str:
-    """把 Action Items 寫入 DB（主）並 append 到 Sheet（副）。
+    """把 Action Items 寫入 DB（唯一寫入位置）。
 
     每個 item 若沒帶 id，自動產生 code（MMDD_N）。
     若 source_meeting (meet_id) 存在於 nb_meetings，會關聯 meeting_id。
+
+    注意：自 2026-05-19 起不再寫入 Google Sheets 副本，DB 為唯一資料來源。
+    `spreadsheet_id` 保留作為部門識別（透過 nb_departments.sheet_id 查 dept_id）。
     """
     if not spreadsheet_id:
         return json.dumps({"success": False, "error": "缺少 spreadsheet_id"}, ensure_ascii=False)
     if not items:
         return json.dumps({"success": False, "error": "items 為空"}, ensure_ascii=False)
 
-    # ── DB 主寫 ──
+    # ── DB 寫入 ──
     try:
         conn = _db_conn()
     except Exception as e:
         return json.dumps({"success": False, "error": f"DB 連線失敗: {e}"}, ensure_ascii=False)
 
     inserted_ids = []
-    enriched_items = []  # 帶補齊後的 code，用來寫 Sheet
+    enriched_items = []  # 帶補齊後的 code，作為回傳結果
     try:
         try:
             with conn:
@@ -914,7 +928,7 @@ def _append_action_items(spreadsheet_id: str, items: list) -> str:
                         new_id = cur.fetchone()["id"]
                         inserted_ids.append(new_id)
 
-                        # 把補齊後的 item 留給 Sheet 寫入
+                        # 補齊後的 item，作為回傳結果
                         enriched = dict(item)
                         enriched["id"] = code
                         enriched["priority"] = priority
@@ -929,57 +943,21 @@ def _append_action_items(spreadsheet_id: str, items: list) -> str:
         except Exception:
             pass
 
-    # ── Sheet 副寫（失敗只 warning） ──
-    sheet_appended = False
-    sheet_url = None
-    sheet_warning = None
-    try:
-        gc = get_gc()
-        sh = gc.open_by_key(spreadsheet_id)
-        ws = sh.sheet1
-        sheet_url = sh.url
-
-        rows = []
-        for item in enriched_items:
-            rows.append([
-                item.get("id", ""),
-                item.get("task", ""),
-                item.get("owner", "待確認"),
-                item.get("priority", "中"),
-                item.get("status", "未開始"),
-                item.get("due_date", ""),
-                item.get("source_meeting", ""),
-                item.get("meeting_date", ""),
-                item.get("notes", ""),
-            ])
-
-        if rows:
-            ws.append_rows(rows, value_input_option='USER_ENTERED')
-        sheet_appended = True
-    except Exception as e:
-        sheet_warning = f"Sheet append 失敗（DB 已成功）: {e}"
-        logger.warning(sheet_warning)
-
+    # 自 2026-05-19 起不再寫入 Google Sheets — DB 為唯一資料來源
     result = {
         "success": True,
         "appended": len(inserted_ids),
         "db_inserted_ids": inserted_ids,
         "codes": [it.get("id") for it in enriched_items],
-        "sheet_appended": sheet_appended,
-        "spreadsheet_url": sheet_url,
     }
-    if sheet_warning:
-        result["warning"] = sheet_warning
     return json.dumps(result, ensure_ascii=False)
 
 
 def _update_action_item(spreadsheet_id: str, item_id: str, updates: dict) -> str:
-    """根據編號找到 Action Item 並更新指定欄位。
+    """根據編號找到 Action Item 並更新指定欄位（DB 為唯一寫入位置）。
 
-    流程：DB 主寫 → Sheet 副寫。
-      1. DB UPDATE 失敗 → 整個 tool 失敗
-      2. DB code 不存在 → 失敗（不寫 Sheet，避免造成不一致）
-      3. DB 成功、Sheet 失敗 → 仍視為 success，但 warning
+    自 2026-05-19 起不再同步 Google Sheets — `spreadsheet_id` 保留作為部門識別
+    （透過 nb_departments.sheet_id 查 dept_id）。
     """
     if not spreadsheet_id or not item_id:
         return json.dumps({"success": False, "error": "缺少 spreadsheet_id 或 item_id"}, ensure_ascii=False)
@@ -1057,47 +1035,14 @@ def _update_action_item(spreadsheet_id: str, item_id: str, updates: dict) -> str
         except Exception:
             pass
 
-    # ── Sheet 副寫（失敗只 warning） ──
-    sheet_updated = False
-    sheet_row = None
-    sheet_warning = None
-    try:
-        gc = get_gc()
-        sh = gc.open_by_key(spreadsheet_id)
-        ws = sh.sheet1
-
-        try:
-            cell = ws.find(item_id, in_column=1)
-        except Exception as find_err:
-            sheet_warning = f"Sheet 找不到編號 {item_id}: {find_err}"
-            logger.warning(sheet_warning)
-        else:
-            sheet_row = cell.row
-            # 欄位對應：A=編號 B=任務 C=負責人 D=優先級 E=狀態 F=截止日 G=來源會議 H=會議日期 I=備註
-            col_map = {
-                "task": 2, "owner": 3, "priority": 4, "status": 5,
-                "due_date": 6, "source_meeting": 7, "meeting_date": 8, "notes": 9
-            }
-            for field, value in updates.items():
-                col = col_map.get(field)
-                if col:
-                    ws.update_cell(sheet_row, col, value)
-            sheet_updated = True
-    except Exception as e:
-        sheet_warning = f"Sheet 更新失敗（DB 已成功）: {e}"
-        logger.warning(sheet_warning)
-
+    # 自 2026-05-19 起不再寫入 Google Sheets — DB 為唯一資料來源
     result = {
         "success": True,
         "item_id": item_id,
         "db_row_id": db_row_id,
-        "row": sheet_row,
         "updated": db_updated_fields,
         "db_updated": True,
-        "sheet_updated": sheet_updated,
     }
-    if sheet_warning:
-        result["warning"] = sheet_warning
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1323,6 +1268,195 @@ def _delete_cron(name: str) -> str:
         }, ensure_ascii=False)
     else:
         return json.dumps({"success": False, "error": "寫入 crontab 失敗"}, ensure_ascii=False)
+
+
+# ── Recap 工具實作 ────────────────────────────────────────
+
+TG_MAX_LEN = 4096
+
+
+def _owner_to_tag(owner: str, members: list) -> str:
+    """把 owner 轉成 TG tag（@username 或本名）"""
+    if not owner or not owner.strip():
+        return "待確認"
+    name = owner.strip()
+    for m in members:
+        if m.get("system_name") == name or name in (m.get("transcript_names") or []):
+            tg = (m.get("tg_username") or "").strip()
+            if tg:
+                return tg if tg.startswith("@") else f"@{tg}"
+    return name
+
+
+def _format_due_date(d) -> str:
+    """格式化 due_date 為 M/D（不存在則空字串）"""
+    if not d:
+        return ""
+    try:
+        return f"{d.month}/{d.day}"
+    except AttributeError:
+        # 字串型態
+        s = str(d)
+        if len(s) >= 10:
+            return f"{int(s[5:7])}/{int(s[8:10])}"
+        return ""
+
+
+def _status_tag(status: str) -> str:
+    if status == "進行中":
+        return "[進行中]"
+    if status == "未開始":
+        return "[未開始]"
+    return f"[{status or '未知'}]"
+
+
+def _status_order(status: str) -> int:
+    if status == "進行中":
+        return 0
+    if status == "未開始":
+        return 1
+    return 2
+
+
+def _build_recap(dept_id: int, meet_id: str) -> str:
+    """組裝會議 recap 文字（純文字 / 條列）。
+
+    回傳格式範例：
+      🔔 NoirsBoxes 會議 Recap
+
+      📅 即將開始：xxx-xxxx-xxx
+
+      【上次會議重點】
+      ...
+
+      【待跟進事項】（N 個）
+      依負責人分組，同 owner 內進行中先：
+
+      @ronshih
+      • 0512_6 ... [進行中] 截止 5/19
+
+      ────────────
+      祝會議順利
+    """
+    # 1. 撈上次 completed 會議 summary
+    last_summary = ""
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT summary FROM nb_meetings
+                    WHERE department_id = %s
+                      AND status = 'completed'
+                      AND meet_id IS DISTINCT FROM %s
+                    ORDER BY end_time DESC NULLS LAST, id DESC
+                    LIMIT 1
+                    """,
+                    (dept_id, meet_id),
+                )
+                row = cur.fetchone()
+                if row and row.get("summary"):
+                    last_summary = (row["summary"] or "").strip()
+
+                # 2. 撈未完成 Action Items
+                cur.execute(
+                    """
+                    SELECT code, description, assignee, status, due_date
+                    FROM nb_action_items
+                    WHERE department_id = %s
+                      AND (status IS NULL OR status != '已完成')
+                    ORDER BY code ASC
+                    """,
+                    (dept_id,),
+                )
+                items = list(cur.fetchall())
+    except Exception as e:
+        logger.warning(f"_build_recap 查詢失敗: {e}")
+        return ""
+
+    # 3. 讀 members
+    config = _read_config()
+    members = config.get("members", [])
+
+    # 4. 分組
+    groups = {}
+    for it in items:
+        tag = _owner_to_tag(it.get("assignee") or "", members)
+        groups.setdefault(tag, []).append(it)
+
+    # 每組內排序
+    for tag in groups:
+        groups[tag].sort(key=lambda x: (_status_order(x.get("status") or ""), x.get("code") or ""))
+
+    # group 排序：「待確認」放最後，其餘按 tag 字典序
+    def _group_key(t):
+        return (1 if t == "待確認" else 0, t)
+    sorted_tags = sorted(groups.keys(), key=_group_key)
+
+    # 5. 組訊息
+    lines = []
+    lines.append("🔔 NoirsBoxes 會議 Recap")
+    lines.append("")
+    lines.append(f"📅 即將開始：{meet_id}")
+    lines.append("")
+
+    if last_summary:
+        # 取摘要第一段（前 300 字以內）
+        first_chunk = last_summary.split("\n\n", 1)[0]
+        if len(first_chunk) > 300:
+            first_chunk = first_chunk[:300] + "…"
+        lines.append("【上次會議重點】")
+        lines.append(first_chunk)
+        lines.append("")
+
+    lines.append(f"【待跟進事項】（{len(items)} 個）")
+    if not items:
+        lines.append("目前沒有未完成的 Action Items")
+    else:
+        lines.append("依負責人分組，同 owner 內進行中先：")
+        lines.append("")
+        for tag in sorted_tags:
+            lines.append(tag)
+            for it in groups[tag]:
+                due = _format_due_date(it.get("due_date"))
+                due_str = f" 截止 {due}" if due else ""
+                code = it.get("code") or ""
+                desc = it.get("description") or ""
+                st = _status_tag(it.get("status") or "")
+                lines.append(f"• {code} {desc} {st}{due_str}")
+            lines.append("")
+
+    lines.append("────────────")
+    lines.append("祝會議順利")
+    return "\n".join(lines)
+
+
+async def _send_tg_message(chat_id: str, text: str) -> None:
+    """直接用 Bot API 發訊息到群組（超過 4096 字會切段）"""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN 未設定")
+    if not chat_id:
+        raise RuntimeError("缺少 chat_id")
+
+    chunks = []
+    remaining = text
+    while len(remaining) > TG_MAX_LEN:
+        cut = remaining.rfind("\n", 0, TG_MAX_LEN)
+        if cut < TG_MAX_LEN // 2:
+            cut = TG_MAX_LEN
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        chunks.append(remaining)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for chunk in chunks:
+            r = await client.post(
+                f"{TG_API_BASE}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk},
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"Telegram API {r.status_code}: {r.text[:200]}")
 
 
 # ── Telegram 通知工具實作 ─────────────────────────────────

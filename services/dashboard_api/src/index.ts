@@ -6,6 +6,8 @@ import { actionItemsRoute } from "./routes/action-items";
 import { meetingsRoute } from "./routes/meetings";
 import { botRoute } from "./routes/bot";
 import { adminRoute } from "./routes/admin";
+import { reportsRoute } from "./routes/reports";
+import { recordingsRoute } from "./routes/recordings";
 
 const app = new Hono();
 
@@ -17,6 +19,8 @@ app.route("/", actionItemsRoute);
 app.route("/", meetingsRoute);
 app.route("/", botRoute);
 app.route("/", adminRoute);
+app.route("/", reportsRoute);
+app.route("/", recordingsRoute);
 
 app.notFound((c) => c.json({ error: "找不到此路徑" }, 404));
 

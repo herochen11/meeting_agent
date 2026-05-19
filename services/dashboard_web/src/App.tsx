@@ -7,6 +7,9 @@ import AdminLoginPage from './pages/AdminLoginPage';
 import LoginPage from './pages/LoginPage';
 import MeetingDetailPage from './pages/MeetingDetailPage';
 import MeetingsListPage from './pages/MeetingsListPage';
+import RecordPage from './pages/RecordPage';
+import ReportDetailPage from './pages/ReportDetailPage';
+import ReportsListPage from './pages/ReportsListPage';
 import { getStoredAdmin, getStoredDept } from './lib/auth';
 
 function RequireDept({ children }: { children: React.ReactNode }) {
@@ -36,6 +39,9 @@ export default function App() {
         <Route path="/" element={<MeetingsListPage />} />
         <Route path="/meetings/:id" element={<MeetingDetailPage />} />
         <Route path="/action-items" element={<ActionItemsPage />} />
+        <Route path="/record" element={<RecordPage />} />
+        <Route path="/reports" element={<ReportsListPage />} />
+        <Route path="/reports/:id" element={<ReportDetailPage />} />
       </Route>
 
       <Route
