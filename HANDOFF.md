@@ -81,16 +81,14 @@ cd /home/user/Agents/meeting_agent
    - APIs & Services → Library → 搜「Google Calendar API」→ Enable
 
 3. **OAuth 同意畫面（OAuth consent screen）**
-   - User Type：**External**（gmail / workspace 帳號都能授權）
-   - 新版 UI 可能拆成 Branding / Audience / Data access / Clients 幾個 tab：
-     - **Branding**：填 App name、User support email、Developer contact
+   - User Type：測試使用者 → 把要連結的 Google email 加進去（Testing 模式只有名單內能授權，最多 100 人）
      - **Data access / Scopes**：加 5 個 scope（缺了 email 那幾個會導致連結失敗 `no_email`）：
        - `openid`
        - `https://www.googleapis.com/auth/userinfo.email`
        - `https://www.googleapis.com/auth/userinfo.profile`
        - `https://www.googleapis.com/auth/calendar.readonly`
        - `https://www.googleapis.com/auth/calendar.events.readonly`
-     - **Audience / Test users**：把要連結的 Google email 加進去（Testing 模式只有名單內能授權，最多 100 人）
+     
 
 4. **建立 OAuth Client ID**
    - Credentials → Create credentials → OAuth client ID
