@@ -594,6 +594,15 @@ Bun.serve({
         const endTime = meeting.end_time || "";
         const eventType = payload.event_type || "meeting.completed";
 
+        // 會議實際時長（分鐘）— 用 Vexa 回報的 start/end 算，嵌進 sub-agent 指令。
+        // 不能讓 sub-agent 用 NOW() 當 end_time，因為它跑完已是會議結束數分鐘後，會把處理時間算進時長。
+        let durationMin: number | null = null;
+        if (startTime && endTime) {
+          const s = new Date(startTime).getTime();
+          const e = new Date(endTime).getTime();
+          if (!isNaN(s) && !isNaN(e) && e > s) durationMin = Math.round((e - s) / 60000);
+        }
+
         // Vexa webhook payload 不帶 native_meeting_id，要自己用 meeting.id 查 DB
         const dbLookup = await lookupNativeMeetingId(meetingId);
         const nativeMeetingId = dbLookup.ok ? dbLookup.value : payloadNativeMeetingId;
@@ -674,10 +683,13 @@ Bun.serve({
           `   SELECT id, department_id FROM nb_meetings`,
           `   WHERE meet_id='${nativeMeetingId}' AND status IN ('等待加入','會議進行中','逐字稿處理中')`,
           `   ORDER BY id DESC LIMIT 1;`,
-          `   - 找到 → UPDATE SET title=正式標題, status='completed', end_time=NOW(),`,
+          `   - 找到 → UPDATE SET title=正式標題, status='completed',`,
+          `     end_time=${endTime ? `'${endTime}'` : "NOW()"},  ← 用 Vexa 回報的實際結束時間，不要用 NOW()（sub-agent 跑完已是數分鐘後，會灌水）`,
+          `     duration_minutes=${durationMin !== null ? durationMin : "ROUND(EXTRACT(EPOCH FROM (<上面的 end_time> - start_time))/60)"},  ← 一定要寫，否則 Dashboard 顯示不出時長`,
           `     summary=議題式摘要, transcript_md_path=...`,
           `     ❗ 不要動 department_id，派發時寫入的就是正確的`,
           `   - 沒找到 → INSERT 新 row（兼容歷史 / 手動加入），department_id 依 chat_id 查 nb_departments`,
+          `     一併寫 start_time=${startTime ? `'${startTime}'` : "<會議開始時間>"}, end_time=${endTime ? `'${endTime}'` : "NOW()"}, duration_minutes=${durationMin !== null ? durationMin : "<(end-start)/60 取整>"}`,
           `4. 自動更新既有 Action Items（依本場會議內容判斷）`,
           ``,
           `   - 查出本部門所有「未開始 / 進行中」的 Action Items：`,

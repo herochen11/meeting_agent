@@ -309,7 +309,9 @@ NoirsBoxes {部門名稱} — YYYY 年 M 月會議報告
      - 派發 bot 時建立 `等待加入`（bot 尚未實際加入）
      - `/api/bot/status` 偵測到 meet_id 出現在 Vexa running_bots 後自動改為 `會議進行中`
      - webhook 進來時 webhook-channel.ts 會自動把 `等待加入 / 會議進行中` 改成 `逐字稿處理中`
-   - 有 → UPDATE 該 row（title 改為議題式摘要的第一個議題或自動產生標題、status='completed'、end_time、summary、participants、transcript_md_path 等）
+   - 有 → UPDATE 該 row（title 改為議題式摘要的第一個議題或自動產生標題、status='completed'、end_time、`duration_minutes`、summary、participants、transcript_md_path 等）
+     - ❗ **`end_time` 用 Vexa webhook 回報的實際結束時間**，不要用 `NOW()`（sub-agent 跑完已是會議結束數分鐘後，會把處理時間灌進時長）
+     - ❗ **一定要寫 `duration_minutes`** = `ROUND((end_time − start_time)/60)`，否則 Dashboard 顯示不出時長（漏寫會停在 NULL）
      - ❗ **不要動 `department_id`** — 派發時寫入的就是正確的部門歸屬
    - 沒有 → INSERT 新 row（兼容歷史 / 手動加入流程），`department_id` 依 chat_id 查 `nb_departments`，**不要查 meeting_map.json**
 4. 用 `append_action_items` 寫入 nb_action_items DB（用步驟 3 row 的 `department_id`）
@@ -596,7 +598,9 @@ dept_id 永遠取 nb_meetings.department_id 該 row 的值（派發 bot 時寫�
 3. 產生摘要和 Action Items
 4. UPSERT 到 nb_meetings：
    - 先 SELECT 同 meet_id 且 status IN ('等待加入', '會議進行中', '逐字稿處理中') 的占位 row（派發 bot 時建立）
-   - 有 → UPDATE 該 row（title=正式標題, status='completed', end_time=NOW(),
+   - 有 → UPDATE 該 row（title=正式標題, status='completed',
+     end_time=<Vexa 回報的實際結束時間，不要用 NOW()>,
+     duration_minutes=ROUND((end_time−start_time)/60),  ← 一定要寫，漏寫 Dashboard 顯示不出時長
      summary=..., participants=..., transcript_md_path=...）
      ❗ 不要動 department_id，派發時寫入的就是正確的
    - 沒有 → INSERT 新 row，department_id 依 chat_id 查 nb_departments（不查 meeting_map.json）
