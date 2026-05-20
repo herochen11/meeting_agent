@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { sql } from "../db";
 import { requireAdmin, type AdminVars } from "../auth";
+import { syncDepartmentToConfig } from "../lib/dept-sync";
 
 export const adminRoute = new Hono<{ Variables: AdminVars }>();
 
@@ -95,6 +96,18 @@ adminRoute.post("/api/admin/departments", async (c) => {
     RETURNING id, name, slug, chat_id, sheet_id, drive_folder_id, created_at
   `;
 
+  // DB row 為主紀錄；同步 config/departments.json + 建立 records 資料夾。
+  // 同步失敗不擋請求，只在回應帶 warning。
+  const sync = await syncDepartmentToConfig({
+    chatId,
+    name,
+    sheetId,
+    driveFolderId,
+  });
+
+  if (!sync.ok && sync.warning) {
+    return c.json({ ...inserted[0], warning: sync.warning }, 201);
+  }
   return c.json(inserted[0], 201);
 });
 
@@ -190,7 +203,33 @@ adminRoute.patch("/api/admin/departments/:id", async (c) => {
     WHERE id = ${id}
     RETURNING id, name, slug, chat_id, sheet_id, drive_folder_id, created_at
   `;
-  return c.json(updated[0]);
+
+  const row = updated[0];
+  if (!row) {
+    return c.json({ error: "更新後找不到部門資料" }, 500);
+  }
+
+  // 若本次更新動到 config 會關心的欄位（name / chat_id / sheet_id / drive_folder_id），
+  // 就用更新後的最終值同步 config/departments.json（slug 不寫入 config）。
+  const touchesConfigFields =
+    "name" in updates ||
+    "chat_id" in updates ||
+    "sheet_id" in updates ||
+    "drive_folder_id" in updates;
+
+  if (touchesConfigFields) {
+    const sync = await syncDepartmentToConfig({
+      chatId: row.chat_id,
+      name: row.name,
+      sheetId: row.sheet_id,
+      driveFolderId: row.drive_folder_id,
+    });
+    if (!sync.ok && sync.warning) {
+      return c.json({ ...row, warning: sync.warning });
+    }
+  }
+
+  return c.json(row);
 });
 
 interface PasswordBody {
