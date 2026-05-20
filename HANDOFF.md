@@ -62,6 +62,62 @@ cd /home/user/Agents/meeting_agent
 
 到 Admin 介面逐一改。
 
+### 1-4. Google Cloud 設定（月曆 / 自動加入會議功能用）
+
+#### 為什麼需要 Google Cloud
+
+「月曆」分頁與「會議自動加入」功能需要讀取使用者的 Google Calendar，這只能透過 **Google Calendar API + OAuth 2.0** 取得。OAuth 一定要先在 Google Cloud Console 建立一個專案 + 一組 OAuth Client，使用者才能在 Dashboard 點「連結 Google 行事曆」授權給系統。
+
+> 注意：**只有 Calendar 需要 Google Cloud**。自 2026-05-19 起 Drive / Sheets / Docs 已從流程移除，不需要設定那些 API，也不需要 Service Account。
+
+「申請 API」聽起來複雜，但 Calendar API 是**免費、不用付費、不用送審額度**。整個設定約 10-15 分鐘。
+
+#### 需要設定的地方（GCP Console）
+
+1. **建立 / 選擇專案**
+   - https://console.cloud.google.com/ → 用公司 Google 帳號登入 → 建新專案（或用既有的）
+
+2. **啟用 Google Calendar API**
+   - APIs & Services → Library → 搜「Google Calendar API」→ Enable
+
+3. **OAuth 同意畫面（OAuth consent screen）**
+   - User Type：**External**（gmail / workspace 帳號都能授權）
+   - 新版 UI 可能拆成 Branding / Audience / Data access / Clients 幾個 tab：
+     - **Branding**：填 App name、User support email、Developer contact
+     - **Data access / Scopes**：加 5 個 scope（缺了 email 那幾個會導致連結失敗 `no_email`）：
+       - `openid`
+       - `https://www.googleapis.com/auth/userinfo.email`
+       - `https://www.googleapis.com/auth/userinfo.profile`
+       - `https://www.googleapis.com/auth/calendar.readonly`
+       - `https://www.googleapis.com/auth/calendar.events.readonly`
+     - **Audience / Test users**：把要連結的 Google email 加進去（Testing 模式只有名單內能授權，最多 100 人）
+
+4. **建立 OAuth Client ID**
+   - Credentials → Create credentials → OAuth client ID
+   - Application type：**Web application**（一定要選這個，不然不會出現 redirect URI 欄位）
+   - Authorized redirect URIs：`http://localhost:8765/api/calendar/oauth-callback`
+   - 建好後拿到 client_id + client_secret
+
+5. **填進 dashboard_api 的 `.env`**
+   ```
+   GOOGLE_OAUTH_CLIENT_ID=<你的-client-id>.apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-<你的-client-secret>
+   GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8765/api/calendar/oauth-callback
+   ```
+   重啟 dashboard_api 生效。
+
+#### OAuth 模式選擇
+
+| 模式 | 適用 | 限制 |
+|---|---|---|
+| **Testing**（最簡單） | 開發 / 內部小團隊 | refresh token **7 天過期**（要定期重連）；只有 Test users 名單能連結 |
+| **In production（未驗證）** | 小型實際使用 | 上限 100 人；每人首次授權看到「未驗證」警告（點「進階 → 繼續」即可）；token 不會 7 天過期 |
+| **In production（已驗證）** | 公開上線 | 無限人數、無警告；需送 Google 審查（敏感 scope 約 1-4 週） |
+
+公司內部用 Testing 或 In production（未驗證）都夠。
+
+> ⚠️ redirect URI 限制：Google 只接受 `http://localhost:PORT/*` 或 `https://網域/*`，**不接受公網 IP**（`http://192.168.x.x` 不行）。所以「連結行事曆」這個動作要在主機本機瀏覽器或 AnyDesk 進主機後操作。
+
 ---
 
 ## 2. 日常功能

@@ -2,6 +2,12 @@
 
 AI 參與 Google Meet 會議，自動產出會議記錄與行動清單，追蹤進度與自動跟催。
 
+> 📖 日常使用方法（操作流程、Dashboard 分頁、TG 指令）見 `HANDOFF.md`；本文件聚焦部署 / 安裝。
+
+> ⚠️ 自 2026-05-19 起架構大改：**所有 Google Drive / Sheets / Docs 寫入皆已從流程移除**。
+> DB（PostgreSQL `nb_*` tables）+ 本地 markdown（`records/<部門>/`）為唯一資料來源。
+> Google Cloud 現在只用於 **Calendar OAuth**（月曆 Tab + 自動加入），不再需要 Service Account。
+
 ## 系統架構
 
 ```
@@ -10,15 +16,20 @@ TG 群組訊息
 Claude Code Session（WSL）
     ↓ 透過 MCP tools
     ├── Vexa MCP → 加入會議 / 查狀態 / 取逐字稿 / summarize
-    ├── Google Sheets MCP（gspread + Service Account）→ 讀寫 Action Items
-    ├── Google Docs MCP（Service Account）→ 寫入會議記錄
-    └── Google Drive MCP（Claude.ai 連接）→ 建立資料夾和空白 Doc
+    ├── Google Calendar MCP（唯讀）→ 讀取行事曆排程（不再用 Sheets / Docs / Drive）
+    └── 寫入：nb_meetings + nb_action_items DB + 本地 markdown（records/<部門>/）
 
 會議結束
     ↓ meeting-api POST http://host.docker.internal:8901/hooks/meeting-completed
     ↓ webhook-channel.ts（Bun，port 8901）接收
     ↓ 推 channel notification 給 Claude Code session
-    ↓ Claude 自動：summarize → Google Sheets → Google Doc → 發 TG
+    ↓ Claude 自動：summarize → 寫 nb_meetings + nb_action_items DB + 本地 markdown → 發 TG（附 Excel）
+
+行事曆自動加入（獨立流程）
+    ↓ calendar-poller（Bun，每 1 分鐘輪詢 nb_calendar_accounts）
+    ↓ POST http://localhost:8901/hooks/calendar-upcoming
+    ↓ webhook-channel.ts 推 channel notification 給 Claude Code session
+    ↓ Claude 判斷 phase：T-5 發提醒到群組 / T-1 派 bot 加入會議（內建 recap）
 ```
 
 ## 專案結構
@@ -40,10 +51,10 @@ Claude Code Session（WSL）
 │   ├── departments.json               ← 部門 + 人員對應表（不進 git）
 │   └── departments.example.json       ← 對應表範本
 ├── credentials/
-│   └── google-service-account.json    ← Google Service Account 金鑰（不進 git）
+│   └── google-service-account.json    ← Google Service Account 金鑰（歷史，現流程不用，可不存在）
 ├── mcp/
-│   ├── server.py                      ← MCP server（所有 17 個 tools）
-│   └── webhook-channel.ts             ← 會議結束通知 + 跟催觸發
+│   ├── server.py                      ← MCP server（所有 tools）
+│   └── webhook-channel.ts             ← 會議結束通知 + 跟催觸發 + 行事曆事件通知
 ├── deploy/compose/
 │   └── docker-compose.yml             ← Vexa 0.10.6 Docker Compose
 └── services/                          ← Vexa 原始碼（官方 + 修正）
@@ -53,7 +64,10 @@ Claude Code Session（WSL）
     └── api-gateway/
 ```
 
-## MCP Tools 清單（18 個）
+## MCP Tools 清單
+
+> ℹ️ 工具仍全部註冊（歷史相容），但 Sheets / Docs 相關工具自 2026-05-19 起流程**不再呼叫**。
+> 「分類」欄的 Sheets / Docs 是歷史命名 — 現在 Action Items 的寫入 / 更新一律落在 `nb_action_items` DB，不再碰 Google Sheet。
 
 | 分類 | Tool | 說明 |
 |---|---|---|
@@ -63,19 +77,19 @@ Claude Code Session（WSL）
 | Vexa | `get_meetings` | 列出最近會議 |
 | Vexa | `get_transcript` | 取得逐字稿 |
 | Vexa | `summarize_meeting` | 讀取逐字稿準備摘要 |
-| Sheets | `create_sheet` | 建立新 Sheet + 設表頭 + 分享 |
-| Sheets | `init_sheet_headers` | 為現有 Sheet 補表頭 |
-| Sheets | `append_action_items` | 新增 Action Items |
-| Sheets | `update_action_item` | 更新單一 Action Item 欄位 |
-| Sheets | `get_action_items` | 讀取 Action Items（可篩選） |
-| Docs | `write_doc` | 寫入內容到 Google Doc |
+| Sheets（歷史） | `create_sheet` | ⚠️ **已淘汰，流程不再呼叫**（建立新 Sheet + 設表頭 + 分享）|
+| Sheets（歷史） | `init_sheet_headers` | ⚠️ **已淘汰，流程不再呼叫**（為現有 Sheet 補表頭）|
+| Action Items（DB） | `append_action_items` | 新增 Action Items — **現寫入 `nb_action_items` DB**（不再寫 Sheet）|
+| Action Items（DB） | `update_action_item` | 更新單一 Action Item 欄位 — **現寫入 `nb_action_items` DB**（不再寫 Sheet）|
+| Action Items | `get_action_items` | 讀取 Action Items（可篩選；回傳所有狀態，彙整端再過濾）|
+| Docs（歷史） | `write_doc` | ⚠️ **已淘汰，流程不再呼叫**（寫入內容到 Google Doc）|
 | Cron | `set_cron` | 建立/更新定時任務 |
 | Cron | `list_crons` | 列出所有定時任務 |
 | Cron | `delete_cron` | 刪除定時任務 |
 | Config | `get_config` | 讀取部門 + 人員對應表 |
 | Config | `add_department` | 新增部門 |
 | Config | `update_member` | 更新人員 TG Username / 逐字稿名字 |
-| TG 通知 | `send_processing` | 發送「處理中」提示，回傳 message_id |
+| TG 通知 | `send_processing` | ⚠️ **已淘汰**，改用 plugin telegram `reply` / `edit_message`（同一 bot session，避免 token 不一致）|
 
 ## Docker 服務（Vexa 0.10.6）
 
@@ -97,7 +111,7 @@ Claude Code Session（WSL）
 | dashboard_api | 8765 | Dashboard 後端 API（Bun + Hono） |
 | dashboard_web | 5173 | Dashboard 前端（Vite + React） |
 | webhook-channel | 8901 | 會議結束通知 + 跟催觸發 + 行事曆事件通知 |
-| calendar-poller | — | 每 1 分鐘輪詢所有 active 的 `nb_calendar_accounts`，發現 T-5 / T-2 內有 Meet 連結的事件就 POST 到 webhook-channel（無 HTTP server，log: `/tmp/calendar_poller.log`） |
+| calendar-poller | — | 每 1 分鐘輪詢所有 active 的 `nb_calendar_accounts`，發現有 Meet 連結的事件就 POST 到 webhook-channel（T-5 發提醒、T-1 自動加入；無 HTTP server，log: `/tmp/calendar_poller.log`） |
 
 ---
 
@@ -173,12 +187,14 @@ tail -f /tmp/dashboard_web.log
 
 ## 資料來源
 
-Dashboard 讀取的資料源（**DB 主、Sheet 鏡像**）：
+Dashboard 讀取的資料源（**DB + 本地 markdown 為唯一來源，自 2026-05-19 起不再同步 Google Sheet**）：
 
-- **PostgreSQL `nb_*` 4 個 table**（Vexa 共用 DB 內）
-  - `nb_departments`、`nb_meetings`、`nb_action_items`、`nb_admin`
+- **PostgreSQL `nb_*` tables**（Vexa 共用 DB 內，port 5458）
+  - 主要：`nb_departments`、`nb_meetings`、`nb_action_items`、`nb_admin`、`nb_reports`
+  - 行事曆：`nb_calendar_accounts`（OAuth 帳號）、`nb_calendar_notified`（T-5 去重）、`nb_calendar_auto_joined`（T-1 去重）
 - **本地 Markdown**：`records/{部門}/MMDD_{標題}_{meet-id}.md`（前端逐字稿渲染用）
-- **Google Sheet 同步**：Telegram bot 改 Action Item 時自動雙寫 DB + Sheet，保持兩邊一致
+
+> ⚠️ **不再有 Google Sheet 雙寫**。Telegram bot 與 Dashboard 改 Action Item 時都只寫同一份 `nb_action_items` DB，兩邊讀同一來源所以天然一致。歷史 Sheet 已凍結、不再同步。
 
 ## 常見問題
 
@@ -192,7 +208,7 @@ A：Vexa 服務沒起來，跑 `./vexa.sh status` 確認。
 A：dashboard_api 不自動 reload，要 `./vexa.sh dashboard-down && ./vexa.sh dashboard-up`。
 
 **Q：Dashboard 跟 Telegram 改的東西不同步**
-A：應該已自動同步（DB+Sheet 雙寫）。若還是不同步，看 `/tmp/dashboard_api.log` 找錯誤訊息。
+A：兩邊都直接讀寫同一份 `nb_action_items` DB（不再有 Sheet 雙寫），理論上不會不同步。若 Dashboard 沒反映最新狀態，重整瀏覽器；若仍異常，看 `/tmp/dashboard_api.log` 找錯誤訊息。
 
 ---
 
@@ -206,7 +222,7 @@ A：應該已自動同步（DB+Sheet 雙寫）。若還是不同步，看 `/tmp/
 - **Bun**：用於 webhook-channel.ts
 - **Claude Code**：需安裝且有 Anthropic 存取權限
 - **Cron**：用於每日跟催定時任務（WSL 預設未啟用，需手動開啟）
-- **Google 帳號**：用於 Google Drive / Calendar MCP 連接
+- **Google 帳號**：用於 Google Calendar OAuth（月曆 Tab + 自動加入；Drive / Sheets / Docs 已不再使用）
 
 ## 部署步驟
 
@@ -232,7 +248,11 @@ cp .env.example .env
 | `VEXA_USER_API_KEY` | MCP 用的 API key（需 bot+tx scope） | Step 6 產生 |
 | `BOT_TOKEN` | Telegram Bot token | 透過 @BotFather 建立 |
 
-### Step 3：設定 Google Service Account
+### Step 3：設定 Google Service Account（⚠️ 已淘汰，可略過）
+
+> ⚠️ **自 2026-05-19 起，現行流程已不再使用 Service Account**（Sheets / Docs / Drive 寫入皆移除）。
+> 全新部署可以**直接跳過本步驟**。唯一需要的 Google 設定是 Calendar OAuth — 見 **Step 4.5**。
+> 以下保留供查閱歷史部署。
 
 1. 到 [Google Cloud Console](https://console.cloud.google.com/) 建立專案
 2. 啟用 API：Google Sheets API、Google Docs API、Google Drive API
@@ -371,17 +391,20 @@ claude mcp list
 應該看到：
 - `vexa: python ./mcp/server.py` → ✅ Connected
 - `vexa-webhook: bun ./mcp/webhook-channel.ts` → ✅ Connected
-- `claude.ai Google Drive` → ✅ Connected
-- `claude.ai Google Calendar` → ✅ Connected
+- `claude.ai Google Calendar` → ✅ Connected（讀取行事曆排程用；Google Drive 已不再需要）
 
 > ⚠️ 如果 `vexa-webhook` 顯示 Failed to connect，確認：`cd mcp && bun install && cd ..`，並確認 port 8901 沒有被佔用。
 
-### Step 9：連接 Google MCP（Claude.ai）
+### Step 9：連接 Google Calendar MCP（Claude.ai）
+
+> ℹ️ Google Drive 已不再需要（Drive / Sheets / Docs 流程已移除）。Dashboard 月曆 Tab 的自動加入功能用的是
+> **專案自己的 Calendar OAuth**（Step 4.5，refresh_token 存在 dashboard_api DB），跟這裡的 Claude.ai MCP 是兩條獨立路徑。
+> 這個 Claude.ai Calendar MCP 僅供 Claude session 讀取行事曆排程；若不需要可略過。
 
 1. 打開 [claude.ai](https://claude.ai)
 2. 進入 Settings → Connected Apps
-3. 連接 Google Drive、Google Calendar
-4. 使用與 Service Account 同一 Google 帳號登入
+3. 連接 Google Calendar
+4. 使用要讀取行事曆的 Google 帳號登入
 
 ### Step 10：啟動 Claude Code Agent
 
@@ -414,10 +437,10 @@ claude mcp list
 ### 測試 3：會議結束自動處理
 在 Google Meet 中說幾句話（測試轉錄），然後結束會議。等待 1-3 分鐘。
 ✅ 預期結果：bot 自動在 TG 群組發送：
-- 會議摘要（8-15 句）
-- Action Items 清單
-- Google Sheet 連結
-- Google Doc 會議記錄連結
+- 議題式會議摘要
+- 提示本次產生的 Action Item 數（已寫入 DB）
+- 附 Excel 檔（該部門所有未完成 Action Items，依負責人分組）
+- 完整摘要 / 逐字稿 / Action Items 可在 Dashboard 查看（不再貼 Google Sheet / Doc 連結）
 
 ### 測試 4：查詢 Action Items
 在 TG 群組發送：
@@ -441,12 +464,18 @@ claude mcp list
 
 ```bash
 # 服務管理
-./vexa.sh up                    # 啟動
+./vexa.sh up                    # 啟動全部（Vexa + speaches + dashboard + webhook + calendar-poller）
 ./vexa.sh down                  # 關閉
 ./vexa.sh restart               # 重啟
 ./vexa.sh status                # 狀態
 ./vexa.sh logs                  # 所有 log
 ./vexa.sh logs meeting-api      # 指定服務 log
+
+# Dashboard / calendar-poller 單獨管理
+./vexa.sh dashboard-up          # 只啟動 dashboard（api + web）
+./vexa.sh dashboard-down        # 只關閉 dashboard
+./vexa.sh calendar-poller-up    # 單獨啟動 calendar-poller（背景輪詢）
+./vexa.sh calendar-poller-down  # 單獨關閉 calendar-poller
 
 # Agent
 ./vexa.sh agent                 # 啟動 Claude Code Agent
@@ -469,8 +498,9 @@ docker exec vexa-postgres-1 psql -U postgres -d vexa -c \
 | 用途 | 方式 | 位置 |
 |---|---|---|
 | Vexa API | API Token（bot+tx scope） | `.env` → `VEXA_USER_API_KEY` |
-| Google Sheets/Docs | Service Account JSON | `credentials/google-service-account.json` |
-| Google Drive/Calendar | Claude.ai Google MCP 連接 | Claude.ai Settings |
+| Google Calendar（Dashboard 月曆 / 自動加入） | OAuth 2.0 Client（使用者級授權，refresh_token 存 DB） | `services/dashboard_api/.env` → `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET`（見 Step 4.5）|
+| Google Calendar（Claude session 讀排程） | Claude.ai Google MCP 連接 | Claude.ai Settings |
+| ~~Google Sheets/Docs~~（已淘汰） | ~~Service Account JSON~~ | ~~`credentials/google-service-account.json`~~（2026-05-19 起流程不再使用）|
 | Admin API | Admin Token | `.env` → `ADMIN_TOKEN` |
 | Telegram | Bot Token | `.env` → `BOT_TOKEN` |
 
@@ -478,7 +508,9 @@ docker exec vexa-postgres-1 psql -U postgres -d vexa -c \
 
 ## 安全規則
 
-- ❌ 不可刪除 Google Drive / Sheets / Calendar 上的任何資料
+- ❌ 不可刪除使用者資料 — DB（`nb_*` tables）與本地 markdown 不可整批清空 / 刪除整個部門
+- ❌ 歷史 Google Drive / Sheets / Docs 已凍結（流程不再寫入），不可刪除或重命名既有檔案
+- ❌ Google Calendar 為**唯讀**用途，不可建立 / 修改 / 刪除任何行事曆事件
 - ❌ `stop_bot` 需使用者明確要求才能執行
 - ❌ 不在 TG 回覆中暴露內部資訊（chat_id、sheet_id、webhook URL 等）
 - ✅ 可以新增檔案和資料夾
@@ -587,12 +619,17 @@ claude mcp remove vexa --scope user
 claude mcp add vexa -s project -- python ./mcp/server.py
 ```
 
-### Google Service Account 憑證缺失
+### Google Service Account 憑證缺失（⚠️ 歷史，現流程不需要）
+> 自 2026-05-19 起 Sheets / Docs / Drive 流程已移除，**缺少這個檔案不影響任何現行功能**。
+> 全新部署不需要它。以下僅供需要還原歷史 Sheets/Docs 行為時參考。
+
 確認金鑰檔存在：
 ```bash
 ls -la credentials/google-service-account.json
 ```
 如果不存在，從 Google Cloud Console 下載並放到 `credentials/` 目錄。
+
+> 月曆 / 自動加入功能若異常，要檢查的是 **Calendar OAuth**（`services/dashboard_api/.env` 的 `GOOGLE_OAUTH_*`，見 Step 4.5），不是這個 Service Account。
 
 ### 修改 `.env` 後服務沒變化
 
